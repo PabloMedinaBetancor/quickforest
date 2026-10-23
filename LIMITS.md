@@ -108,8 +108,9 @@ The case: a random forest of 400,000 trees from which the best 10 or 100 are wan
   30,000 to 1,200,000 trees (117 to 278 MB with the codes in a file; the codes add their own size while they stay in memory, up to half of
   `--memory-mb`): it does not depend on the number of trees. Time and disk do.
   The model file is mapped and its pages are let go of behind the reader (32 MB at a time), so what stays resident of it is that window plus
-  what one page fault maps: 64 KB on most kernels, up to 2 MB where the kernel holds the file in 2 MB folios of its page cache (the mapping
-  asks for small pages, `MADV_NOHUGEPAGE`); it does not grow with the file. `tests/diag_pages.py` prints, for any machine, which stretches
+  what one page fault maps: 64 KB on most kernels, 2 MB where the kernel holds the file in 2 MB folios of its page cache (measured on GitHub's
+  runners, Linux 6.17: a file written in one write; one written in pieces or read back from disk maps 64 KB). The mapping asks for small pages
+  (`MADV_NOHUGEPAGE`); it does not grow with the file. `tests/diag_pages.py` prints, for any machine, which stretches
   of a model file stay mapped.
 
 Measured on a 4-thread laptop (Intel i3-6006U, 2 cores, 3.3 GB of RAM, 2.2 GB for the user; nothing else running during these runs, 2026-10-22):
