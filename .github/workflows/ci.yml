@@ -1,0 +1,101 @@
+# QuickForest CI. The repository root is the package folder.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  lint:
+    name: lint (ruff, rustfmt, clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"  # the toolchain of rust/rust-toolchain.toml
+          components: rustfmt, clippy
+      - run: pip install ruff==0.16.10
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: cargo fmt --check
+        working-directory: rust
+      - run: cargo clippy --release --all-targets -- -D warnings
+        working-directory: rust
+
+  test:
+    name: test (${{ matrix.os }}, python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.10" }
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.12" }
+          - { os: ubuntu-24.04-arm, python: "3.10" }
+          - { os: ubuntu-24.04-arm, python: "3.12" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"  # the toolchain of rust/rust-toolchain.toml
+          components: rustfmt, clippy, llvm-tools
+      - name: Toolchain in use (rustc, its LLVM, and the llvm-profdata that goes with it)
+        run: |
+          rustc -vV
+          ls -l "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata  # codegen-pgo takes the one of rustc's own toolchain
+      - name: Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy xgboost lightgbm pandas scikit-learn
+          # YDF is optional: its tests skip when it cannot be installed
+          pip install ydf || echo "ydf is not available for this platform, its tests will be skipped"
+      - name: Diagnostic report - which pages of a model file stay mapped while it is read (never fails the job)
+        continue-on-error: true
+        run: python tests/diag_pages.py
+      - name: Committed library (x86_64 only), before anything is rebuilt - the quick differential runs on the file users download
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sha256sum bin/libtreeflat-x86_64.so | tee committed.sha256
+          python tests/differential/run_differential.py --mode quick
+      - name: Build the evaluator (fmt, clippy -D warnings, cargo test incl. the mutation test, then the library for this machine)
+        run: rust/build.sh
+      - name: Rebuilt library against the committed one (x86_64 only; report only)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          committed=$(cut -d' ' -f1 committed.sha256)
+          rebuilt=$(sha256sum bin/libtreeflat-x86_64.so | cut -d' ' -f1)
+          if [ "$committed" = "$rebuilt" ]; then
+            echo "the rebuilt library is byte for byte the committed one ($rebuilt)"
+          else
+            # A different linker or system library on the runner can change the bytes without a change in the source: not a failure.
+            echo "::warning::the rebuilt library differs from the committed one (committed $committed, rebuilt $rebuilt): rebuild it on the reference machine if rust/ changed"
+          fi
+      - name: Rust mutation test in the debug profile (bounds checks on)
+        run: cargo test
+        working-directory: rust
+      - name: Unit tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+      - name: Differential test, quick mode
+        run: python tests/differential/run_differential.py --mode quick
+      - name: Fuzz test, quick mode
+        run: python tests/fuzz/fuzz_loader.py --mode quick

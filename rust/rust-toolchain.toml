@@ -1,0 +1,6 @@
+# The toolchain of the shipped library (bin/libtreeflat-x86_64.so is built with it; docs/REFERENCE.md describes the rebuild).
+# Cargo.toml's rust-version is the oldest compiler that can build the crate; this file is the one the published bytes come from.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

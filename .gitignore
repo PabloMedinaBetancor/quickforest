@@ -1,0 +1,11 @@
+target/
+__pycache__/
+*.pyc
+tests/differential/out/
+tests/fuzz/out/
+.ruff_cache/
+.pytest_cache/
+venv/
+.venv/
+# a library built on another architecture (rust/build.sh writes bin/libtreeflat-$(uname -m).so); the x86-64 one is tracked
+bin/libtreeflat-aarch64.so
