@@ -6,8 +6,8 @@ python3 -m pytest tests/test_codecheck_cc2.py
 The engine tests need a library that reads format 7: build it with rust/build.sh and point TREEFLAT_LIB at it (QF_REQUIRE_FORMAT7=1 makes a stale
 library fail instead of skip)."""
 
-import sys
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
