@@ -4,6 +4,7 @@ checked against xgboost; plus regression, the one-command pipeline and the plugg
     python3 -m unittest discover -s tests        (from the repository root, with a Python that has xgboost)
 """
 
+import importlib.util
 import json
 import os
 import sys
@@ -1454,7 +1455,7 @@ class PipelineTest(unittest.TestCase):
         subprocess.run([sys.executable, "-c", big], check=True)
         info = compile.compile_model(self.t / "gb.ubj", self.t / "peak.so", backend="codegen", block=64)
         self.assertGreater(info["rustc_peak_mb"], 20)  # a real figure
-        self.assertLess(info["rustc_peak_mb"], 600, info)
+        self.assertLess(info["rustc_peak_mb"], 700, info)  # below the planted child's 700 MB: this build's own peak, not the biggest child ever waited for
 
     def test_backend_auto_keeps_the_fastest_exact_one(self):
         """`compile --backend auto`: times what can run here on held-out rows, keeps an exact winner, remembers it in OUT.choice.json."""
@@ -1716,6 +1717,7 @@ class K1PrunePinTest(unittest.TestCase):
                 self.run_pin(tag, model, d / "sel.npz", {"keep": "30%", "regression": qf.RegBar(space)})
 
     @unittest.skipUnless((MULTI / "ydf_rf_binary").is_dir(), "the binary YDF fixture is not here")
+    @unittest.skipIf(importlib.util.find_spec("ydf") is None, "ydf is not installed")
     def test_binary_ydf_random_forest_pin(self):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bench"))
         import common as c

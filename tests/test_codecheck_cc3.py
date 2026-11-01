@@ -57,6 +57,18 @@ class OffsetWrapTest(unittest.TestCase):
         self.assertEqual(len(r.stdout.strip().splitlines()), 1)
 
 
+class _NanRefusingForest(RandomForestRegressor):
+    """A forest that refuses NaN by construction (newer scikit-learn releases accept NaN in forests, so the library cannot be relied on to refuse)."""
+
+    def predict(self, X):
+        if np.isnan(np.asarray(X, dtype=np.float64)).any():
+            raise ValueError("Input X contains NaN. This estimator does not accept missing values")
+        return super().predict(X)
+
+
+_NanRefusingForest.__name__ = "RandomForestRegressor"  # the exporter reads the class name
+
+
 class NanRefusingEstimatorTest(unittest.TestCase):
     """code check 3, finding 2 (major): an estimator that refuses NaN (RandomForest with criterion="absolute_error") made the export drop every probe row
     that held a NaN. With 6 % of the cells NaN that is every row from about 100 features: the export crashed on an empty array (sklearn's
@@ -66,7 +78,7 @@ class NanRefusingEstimatorTest(unittest.TestCase):
     def fit(self, n_features):
         rng = np.random.default_rng(1)
         x = rng.normal(size=(300, n_features)).astype(np.float32)
-        return RandomForestRegressor(4, criterion="absolute_error", max_depth=4, random_state=0).fit(x, x[:, 0]), x
+        return _NanRefusingForest(4, max_depth=4, random_state=0).fit(x, x[:, 0]), x
 
     def test_many_features_still_export_and_verify_on_full_probe_set(self):
         est, _x = self.fit(200)

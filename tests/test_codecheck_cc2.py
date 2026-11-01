@@ -7,6 +7,7 @@ The engine tests need a library that reads format 7: build it with rust/build.sh
 library fail instead of skip)."""
 
 import sys
+import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -163,6 +164,8 @@ class DecisionTableTest(unittest.TestCase):
         for name, outputs in self.CASES:
             with self.subTest(model=name), tempfile.TemporaryDirectory() as d:
                 d = Path(d)
+                if name.startswith("ydf") and importlib.util.find_spec("ydf") is None:
+                    continue  # reading a YDF model needs the ydf library (it has no wheel on every platform)
                 if name.endswith(".joblib"):
                     import joblib
 
