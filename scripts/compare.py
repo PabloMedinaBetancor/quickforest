@@ -22,11 +22,16 @@ import sys
 import time
 from pathlib import Path
 
+if len(sys.argv) > 3 and sys.argv[1] == "--worker":
+    # the worker runs under `python -I` (no user site): the parent tells it the folders it imports numpy from (backend_codegen.parent_site_paths)
+    sys.path.extend(p for p in json.loads(sys.argv[3]) if p not in sys.path)
+
 import numpy as np
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import backend_codegen
 import backends
 import check
 import evaluator
@@ -157,8 +162,10 @@ def prepare(model, data, work, *, average, eq_rows, n_random, speed_rows, seed, 
         return files, forest  # the sets, the library's answers and the profile rows of an identical earlier call are all there
     for stale in work.glob("ref-*.npy"):  # answers of another model (or other sets): the cache is keyed by set name and length only
         stale.unlink()
-    x_all = qf.load_data(data)["X"]
+    d_all = qf.load_data(data)
+    x_all = d_all["X"]
     qf.check_width(x_all, forest.n_features, data)
+    qf.require_truth_columns(d_all.get("y"), qf.forest_truth_outputs(forest), data)
     rng = np.random.default_rng(seed)
     pick = np.sort(rng.permutation(len(x_all))[: min(eq_rows, len(x_all))])
     sets = {"data": np.ascontiguousarray(x_all[pick])}
@@ -235,7 +242,10 @@ def measure_all(
     lib_rate, library = library_speed(files, speed_x, threads=threads)
     log(f"{library} {threads} thread(s): {lib_rate:,.0f} rows/s ({time.perf_counter() - t:.0f} s)")
     # as check.py
-    rule = qf.make_rule(decision, forest.groups, forest.kind, None, None, forest.task) if forest.task == "classification" else None
+    rule, segs = (
+        qf.forest_rule(decision, forest),
+        qf.forest_segments(forest),
+    )  # a model of several outputs is judged per output, as check does
     rows, flat_out = [], {}
     for row in built:
         name = row["backend"]
@@ -257,7 +267,14 @@ def measure_all(
             "result": str(work / f"res-{name}.json"),
         }
         qf.replace_file(work / f"spec-{name}.json", data=json.dumps(spec).encode())
-        cmd = [sys.executable, "-I", str(HERE / "compare.py"), "--worker", str(work / f"spec-{name}.json")]
+        cmd = [
+            sys.executable,
+            "-I",
+            str(HERE / "compare.py"),
+            "--worker",
+            str(work / f"spec-{name}.json"),
+            json.dumps(backend_codegen.parent_site_paths()),
+        ]
         if cpu is not None:
             cmd = ["taskset", "-c", str(cpu), *cmd]
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
@@ -270,7 +287,7 @@ def measure_all(
         ok, worst, mism, bit = True, 0.0, 0, True
         for k in sets:
             got = np.load(work / f"{name}-{k}.npy")
-            c = check.compare(k, refs[k][: len(got)], got, decision, rule, forest.groups, exact=exact)
+            c = check.compare(k, refs[k][: len(got)], got, decision, rule, forest.groups, exact=exact, segments=segs)
             ok &= c["ok"]
             worst, mism = max(worst, c["max_err"]), mism + c["decision_mismatches"]
             row[f"rows_{k}"] = c["rows"]
@@ -421,7 +438,7 @@ def main():
         "--opt",
         action="append",
         default=[],
-        help="compile option key=value (block, chunk_nodes, jobs, opt_level, codegen_units, keep_src, shape, target_cpu, ram_mb, f64_leaves), repeatable",
+        help="compile option key=value (block, chunk_nodes, jobs, opt_level, codegen_units, lto [off|fat], inline_threshold, unit [single|chunks], compile_preset, pgo, keep_src, shape, target_cpu, ram_mb, f64_leaves), repeatable",
     )
     a = ap.parse_args()
     names = list(backends.BACKENDS)

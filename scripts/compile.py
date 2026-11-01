@@ -2,11 +2,12 @@
 """Compile an xgboost / LightGBM / YDF model (pruned or not; a file, or a directory of fold files averaged) to ONE artifact.
 
     compile.py MODEL(file|dir) OUT [--average output|margin] [--backend best|flat|auto|...] [--data DATA.npz --decision argmax]
-               [--native | --target-cpu x86-64-v2|x86-64-v3|x86-64|...] [--shape fast|top]
+               [--native | --target-cpu x86-64-v2|x86-64-v3|x86-64|...]
+               [--compile-preset 1.1|1.0] [--lto off|fat] [--codegen-units N] [--inline-threshold N|default] [--pgo on|off] [--cspgo on|off] [--shape fast]
 
-The default backend, `best`, is the fastest build this machine can make: generated code (rustc builds it at opt-level 3, no link-time optimisation, 16 codegen units
-per chunk: `--shape fast`, or `--shape top` = one codegen unit everywhere and no LTO across chunks; the jobs and units are planned against the free RAM), profile-guided
-(`codegen-pgo`) when --data gives representative rows, else `codegen-block` with one notice line (also when no llvm-profdata of rustc's LLVM version is found); the flat format only when rustc is
+The default backend, `best`, is the fastest build this machine can make: generated code (rustc builds it at opt-level 3 with fat link-time optimisation, 16 codegen units and
+`-C llvm-args=-inline-threshold=3000`: the `1.1` compile preset; `--compile-preset 1.0` is exactly QF 1.0's build, no LTO and 16 codegen units a chunk (`--shape fast` is the same); one codegen unit only when `--codegen-units 1` asks for it; `--lto`, `--codegen-units`, `--inline-threshold`, `--pgo` and `--cspgo` (CS-PGO, on by default in a profile-guided fat-LTO chunks build; off = plain PGO) set one setting each; the jobs and units are planned against the free RAM, which fat LTO needs more of),
+profile-guided (`codegen-pgo`, its instrumented build in exactly the same shape) when --data gives representative rows, else `codegen-block` with one notice line (also when no llvm-profdata of rustc's LLVM version is found); the flat format only when rustc is
 missing, too little RAM is free or the model is beyond what generated code holds (a notice says why). OUT is a `.so` (or a flat file) and `OUT.choice.json` names the
 loader: load it with `backends.load_artifact(OUT)`. The generated code is built for the portable x86-64-v2 CPU (`generic` on arm); `--native` (or `--target-cpu CPU`) builds for
 this machine's CPU instead: the build only runs on that CPU type, and a library built for features the CPU lacks is refused at load time. `--backend flat` writes packed nodes plus the prebuilt evaluator library
@@ -49,34 +50,47 @@ def profile_rows(data, path: Path, n_features: int | None = None) -> None:
     np.save(path, np.ascontiguousarray(x, dtype=np.float32))
 
 
-def best_backend(forest: qf.Forest, have_data: bool) -> tuple[str, str | None]:
+def best_backend(forest: qf.Forest, have_data: bool, options: dict | None = None) -> tuple[str, str | None]:
     """(backend, notice) of the `best` default: generated code with a profile (`codegen-pgo`) when representative rows are given, `codegen-block`
-    without them, the flat format only where generated code cannot be built (the notice names why). The notice is None when nothing was given up."""
+    without them, the flat format only where generated code cannot be built (the notice names why). The notice is None when nothing was given up.
+    `options["pgo"]` decides it when given: `off` is `codegen-block` whatever the rows, `on` is `codegen-pgo` and refuses without rows or without
+    llvm-profdata instead of building something else. `options` also holds the compile settings, which set how much RAM a build is planned to need."""
+    settings = backend_codegen.resolve_compile(options or {})
+    pgo = settings["pgo"]
+    if pgo == "on" and not have_data:
+        raise ValueError("--pgo on runs a profile pass over real rows: give --data")
+
+    def flat(why: str) -> tuple[str, str]:
+        """The flat format with the reason; `--pgo on` was asked for by name, so there it is refused with the same reason instead."""
+        if pgo == "on":
+            raise ValueError(f"--pgo on needs generated code, which cannot be built here: {why}")
+        return "flat", f"{why}: compiled to the flat format"
+
     try:
         backend_codegen.toolchain_bin()
     except backend_codegen.ToolchainMissing:
-        return "flat", (
-            "rustc not found: compiled to the flat format, which is slower than generated code; install rustc (apt install rustc, or rustup) "
-            "or set RUST_DIR for the fast build"
+        return flat(
+            "rustc not found (the flat format is slower than generated code); install rustc (apt install rustc, or rustup) or set RUST_DIR for the fast build"
         )
     import choose
 
     if forest.n_nodes > choose.MAX_CODEGEN_NODES:
-        return (
-            "flat",
-            f"{forest.n_nodes:,} nodes is above the {choose.MAX_CODEGEN_NODES:,} generated code was built for: compiled to the flat format",
-        )
+        return flat(f"{forest.n_nodes:,} nodes is above the {choose.MAX_CODEGEN_NODES:,} generated code was built for")
     if (depth := backend_codegen.too_deep(forest)) is not None:
-        return (
-            "flat",
-            f"a tree is {depth:,} levels deep, above the {backend_codegen.MAX_TREE_DEPTH:,} generated code holds: compiled to the flat format",
+        return flat(f"a tree is {depth:,} levels deep, above the {backend_codegen.MAX_TREE_DEPTH:,} generated code holds")
+    free = backend_codegen.available_ram_mb(options or {})
+    # the smallest build there is: a chunk job (a one-crate build that does not fit falls back to chunks, so it is planned as chunks) and the driver's link
+    chunks = {**settings, "unit": "chunks"}
+    factor, link_factor = backend_codegen.peak_factor(chunks), backend_codegen.link_peak_factor(chunks)
+    if free is not None and not backend_codegen.plan_build([backend_codegen.MIN_CHUNK_NODES], 1, 1, free, factor, link_factor):
+        lighter = (
+            f" ({backend_codegen.describe_compile(settings)} needs more than QF 1.0's build; --compile-preset 1.0 or --lto off builds lighter)"
+            if max(factor, link_factor) > 1
+            else ""
         )
-    free = backend_codegen.available_ram_mb({})
-    if free is not None and not backend_codegen.plan_build([backend_codegen.MIN_CHUNK_NODES], 1, 1, free):
-        return (
-            "flat",
-            f"only {free:,.0f} MB of RAM are free, too little to build generated code without swapping: compiled to the flat format",
-        )
+        return flat(f"only {free:,.0f} MB of RAM are free, too little to build generated code without swapping{lighter}")
+    if pgo == "off":
+        return "codegen-block", None
     if not have_data:
         return "codegen-block", (
             "no --data: the profile-guided build (codegen-pgo, usually faster) needs representative rows; built codegen-block. "
@@ -85,6 +99,8 @@ def best_backend(forest: qf.Forest, have_data: bool) -> tuple[str, str | None]:
     try:
         backend_codegen.llvm_profdata()
     except backend_codegen.ToolchainMissing as e:
+        if pgo == "on":
+            raise  # asked for by name: it fails with the line, it does not build something else
         return (
             "codegen-block",
             f"{getattr(e, 'why', 'llvm-profdata not found')}: built codegen-block, without the profile-guided build; "
@@ -93,9 +109,11 @@ def best_backend(forest: qf.Forest, have_data: bool) -> tuple[str, str | None]:
     return "codegen-pgo", None
 
 
-def resolve_best(model, average: str = "output", float32_sums: bool = False, have_data: bool = True) -> tuple[str, str | None]:
+def resolve_best(
+    model, average: str = "output", float32_sums: bool = False, have_data: bool = True, options: dict | None = None
+) -> tuple[str, str | None]:
     """`best_backend` for a model on disk (`optimize` names its artifact after the backend, so it asks before compiling)."""
-    return best_backend(qf.load_forest(qf_formats.model_files(model), average, float32_sums), have_data)
+    return best_backend(qf.load_forest(qf_formats.model_files(model), average, float32_sums), have_data, options)
 
 
 def compile_model(model, out, backend: str = "best", average: str = "output", **options) -> dict:
@@ -114,6 +132,11 @@ def compile_model(model, out, backend: str = "best", average: str = "output", **
 
         if not options.get("data"):
             raise ValueError("--backend auto times the candidates on real rows: give --data")
+        backend_codegen.resolve_compile(options)  # a mistyped setting is found before the candidates are built
+        if options.get("pgo") is not None:
+            raise ValueError(
+                "--pgo chooses between the profile-guided build and the plain one: --backend auto builds and times both, give it no --pgo"
+            )
         t = time.perf_counter()
         info = choose.choose(
             model,
@@ -125,23 +148,24 @@ def compile_model(model, out, backend: str = "best", average: str = "output", **
             compile_options={
                 **{k: bool(options.get(k)) for k in ("f64_leaves", "float32_sums")},
                 **({"target_cpu": options["target_cpu"]} if options.get("target_cpu") else {}),
-                **({"shape": options["shape"]} if options.get("shape") else {}),
+                **{k: options[k] for k in backend_codegen.COMPILE_KEYS if k != "pgo" and options.get(k) is not None},
             },
         )
         info.update(average=average, compile_seconds=round(time.perf_counter() - t, 1))
         return info
     be = None if backend == "best" else backends.get(backend)  # a mistyped backend is found before the model is read
-    backend_codegen.resolve_shape(options)  # a mistyped --shape is found before the model is read
+    backend_codegen.resolve_compile(options)  # a mistyped setting (--shape, --lto, --codegen-units, ...) is found before the model is read
     if options.get("target_cpu") and backend in ("flat", "wave", "wave-avx2"):
         raise ValueError(f"--native and --target-cpu choose the CPU generated code is built for: {backend} is not generated code")
-    if options.get("shape") and backend in ("flat", "wave", "wave-avx2"):
-        raise ValueError(f"--shape chooses how generated code is built: {backend} is not generated code")
+    if backend in ("flat", "wave", "wave-avx2") and (given := [k for k in backend_codegen.COMPILE_KEYS if options.get(k) is not None]):
+        flags = ", ".join("--" + k.replace("_", "-") for k in given)
+        raise ValueError(f"{flags} choose{'s' if len(given) == 1 else ''} how generated code is built: {backend} is not generated code")
     t0 = time.perf_counter()
     forest = qf.load_forest(qf_formats.model_files(model), average, bool(options.get("float32_sums")))
     qf.require_rule(options.get("decision", "argmax"), forest)
     notice = None
     if backend == "best":
-        backend, notice = best_backend(forest, bool(options.get("data")) or options.get("pgo_rows") is not None)
+        backend, notice = best_backend(forest, bool(options.get("data")) or options.get("pgo_rows") is not None, options)
         be = backends.get(backend)
     missing = forest.requires - set(getattr(be, "supports", ()))
     if missing:
@@ -153,7 +177,8 @@ def compile_model(model, out, backend: str = "best", average: str = "output", **
     # a profile-guided build learns which branches are taken from real rows; when `best` chose it (here, or `optimize`, which names the
     # artifact before the build and says so with pgo_fallback) and the rows are too few or too unlike one another to be the workload, it builds
     # codegen-block and says why in the notice. Asked for by name, it fails with that line.
-    fallback = requested == "best" or bool(options.pop("pgo_fallback", False))
+    # `--pgo on` was asked for by name: it fails with the original line, it never builds codegen-block.
+    fallback = (requested == "best" or bool(options.pop("pgo_fallback", False))) and backend_codegen.resolve_compile(options)["pgo"] != "on"
     try:
         if getattr(be, "pgo", False) and options.get("pgo_rows") is None:
             if not options.get("data"):
@@ -211,12 +236,7 @@ def main():
         action="store_true",
         help="build for the CPU of THIS machine (--target-cpu native): the build only runs on that CPU type; measured no faster than the portable build on our workloads",
     )
-    ap.add_argument(
-        "--shape",
-        choices=tuple(backend_codegen.SHAPES),
-        help="how generated code is built: fast (default: opt 3, no link-time optimisation, 16 codegen units; the profile-guided pass in the same shape) "
-        "or top (one codegen unit everywhere, chunks and driver, and no LTO across chunks; slower to build)",
-    )
+    backend_codegen.add_compile_arguments(ap)
     ap.add_argument("--decision", default="argmax")
     ap.add_argument(
         "--f64-leaves",
@@ -241,7 +261,7 @@ def main():
             a.average,
             no_lib=a.no_lib,
             target_cpu=backend_codegen.cpu_option(a.native, a.target_cpu),
-            shape=a.shape,
+            **backend_codegen.compile_options(a),
             data=a.data,
             decision=a.decision,
             f64_leaves=a.f64_leaves,
@@ -256,7 +276,7 @@ def main():
         sys.exit(3)
     parsed = f"parse {info['parse_seconds']} s, " if "parse_seconds" in info else ""  # --backend auto parses inside each candidate's build
     cpu = f", target {info['target_cpu']}" if "target_cpu" in info else ""
-    cpu += f", shape {info['shape']}" if "shape" in info else ""
+    cpu += f", {info['build']}" if "build" in info else ""
     if info.get("notice"):
         print(f"compile.py: note: {info['notice']}", file=sys.stderr)
     print(

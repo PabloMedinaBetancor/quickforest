@@ -91,8 +91,8 @@ OFF = {
     "checksum": 40,
     "flags": 48,
     "cat_words": 52,
-    "lin_leaves": 56,
-    "lin_coefs": 60,
+    "lin_leaves": 56,  # format 7: vec_leaves
+    "lin_coefs": 60,  # format 7: n_segments
 }
 SPECIAL32 = [0, 1, 2, 3, 7, 8, 255, 256, 0x7FFF, 0x8000, 0xFFFF, 0x10000, 0x7FFFFFFF, 0x80000000, 0x80000001, 0xFFFFFFFE, 0xFFFFFFFF]
 SPECIAL64 = [
@@ -127,7 +127,13 @@ KINDS = [
     "lin",
     "multi",
     "hdr-flip",  # appended last: the seeds of the kinds above stay what they were
+    "vecidx",
+    "vectab",
+    "seg",
+    "vechead",
 ]
+VECTOR_KINDS = ("vecidx", "vectab", "seg", "vechead")  # they damage the vector-leaf tables of format 7: run on the vector bases only
+VECTOR_BASES = ("vec_f32", "vec_ext64", "vec_cols")
 
 
 def u32(b, at):
@@ -142,8 +148,35 @@ def layout(b: bytes) -> dict:
     node_at = tree_at + f["n_trees"] * 8
     cats_at = node_at + f["n_nodes"] * 8
     lin_at = cats_at + -(-(f["cat_words"] * 4) // 8) * 8
+    if f["format"] == 7:  # bytes 56 and 60 count the vector table and the segments, not linear leaves
+        vec_leaves, n_segments = f["lin_leaves"], f["lin_coefs"]
+        vec_bytes = -(-(vec_leaves * f["n_groups"] * (8 if f["flags"] & 32 else 4)) // 8) * 8
+        return {
+            **f,
+            "lin_leaves": 0,
+            "lin_coefs": 0,
+            "vec_leaves": vec_leaves,
+            "n_segments": n_segments,
+            "vec_width": 8 if f["flags"] & 32 else 4,
+            "vec_at": lin_at,
+            "seg_at": lin_at + vec_bytes,
+            "tree_at": tree_at,
+            "node_at": node_at,
+            "cats_at": cats_at,
+            "lin_at": lin_at,
+            "coef_at": lin_at,
+        }
     coef_at = lin_at + f["lin_leaves"] * 24
-    return {**f, "tree_at": tree_at, "node_at": node_at, "cats_at": cats_at, "lin_at": lin_at, "coef_at": coef_at}
+    return {
+        **f,
+        "vec_leaves": 0,
+        "n_segments": 0,
+        "tree_at": tree_at,
+        "node_at": node_at,
+        "cats_at": cats_at,
+        "lin_at": lin_at,
+        "coef_at": coef_at,
+    }
 
 
 def fnv1a(data: bytes) -> int:
@@ -282,12 +315,105 @@ def mutate(base: bytes, kind: str, rng, depth: int = 0) -> bytes:
             put64(L["coef_at"] + 16 * k, pick([L["n_features"], 0xFFFFFFFF, 0x1_0000_0000, 0x7FFFFFFF]))
             put64(L["coef_at"] + 16 * k + 8, pick([0x7FF8000000000000, 0x7FF0000000000000, 0xFFF0000000000000]))
         return refix(b)
+    if kind in VECTOR_KINDS:
+        return mutate_vector(b, kind, rng, L)
     if kind == "multi" and depth == 0:
         out = bytes(b)
+        pool = [k for k in KINDS if k != "multi" and (k not in VECTOR_KINDS or L["format"] == 7)]
         for _ in range(int(rng.integers(2, 6))):
-            out = mutate(out if len(out) >= HEADER + 8 else base, pick([k for k in KINDS if k != "multi"]), rng, depth + 1)
+            out = mutate(out if len(out) >= HEADER + 8 else base, pick(pool), rng, depth + 1)
         return out
     return bytes(b)
+
+
+def mutate_vector(b: bytearray, kind: str, rng, L: dict) -> bytes:
+    """The four mutations of the format-7 tables, each with the checksum repaired so the loader's structure checks (L5-L8) are reached."""
+
+    def pick(seq):
+        return seq[int(rng.integers(0, len(seq)))]
+
+    def put(at, fmt, v):
+        if 0 <= at and at + struct.calcsize(fmt) <= len(b):
+            struct.pack_into(fmt, b, at, v)
+
+    if L["format"] != 7:
+        return bytes(b)
+    if kind == "vecidx":  # the row number a vector leaf names: off by one, repeated, past the table, huge
+        leaves = [
+            L["node_at"] + 8 * i
+            for i in range(min(L["n_nodes"], len(b) // 8))
+            if L["node_at"] + 8 * i + 8 <= len(b) and (struct.unpack_from("<Q", b, L["node_at"] + 8 * i)[0] >> 32) & 0xFFFF == 0
+        ]
+        if leaves:
+            at = pick(leaves)
+            old = u32(b, at)
+            put(
+                at,
+                "<I",
+                pick(
+                    [
+                        old + 1,
+                        old - 1,
+                        0,
+                        1,
+                        L["vec_leaves"],
+                        L["vec_leaves"] - 1,
+                        0x7FFFFFFF,
+                        0x80000000,
+                        0xFFFFFFFF,
+                        int(rng.integers(0, 2**32)),
+                    ]
+                )
+                & 0xFFFFFFFF,
+            )
+            if rng.random() < 0.15:  # bits 32..64 of a leaf word must be zero
+                put(at + 4, "<I", pick([1, 0x8000, 0xFFFF, 0x80000000, 0xFFFFFFFF]))
+    elif kind == "vectab":  # a table value that is not a finite number, or one that overflows the sums
+        bad = (float("nan"), float("inf"), float("-inf"), 3.0e38, -3.0e38, 1.0e300)
+        for _ in range(int(rng.integers(1, 4))):
+            k = int(rng.integers(0, max(1, L["vec_leaves"] * L["n_groups"])))
+            v = pick(bad)
+            if L["vec_width"] == 4:
+                v = float(np.float32(v)) if abs(v) < 3.4e38 else (float("inf") if v > 0 else float("-inf"))
+            put(L["vec_at"] + L["vec_width"] * k, "<f" if L["vec_width"] == 4 else "<d", v)
+    elif kind == "seg":  # offsets swapped, repeated, not from 0, not ending at the group count
+        if L["n_segments"] and L["seg_at"] < len(b):
+            # a stacked mutation may already have set the count to 0xFFFFFFFF: never build more offsets than the file holds (the harness hung on it)
+            n = min(L["n_segments"] + 1, (len(b) - L["seg_at"]) // 4 + 1, 4096)
+            j = int(rng.integers(0, n))
+            how = int(rng.integers(0, 5))
+            offs = [u32(b, L["seg_at"] + 4 * i) if L["seg_at"] + 4 * i + 4 <= len(b) else 0 for i in range(n)]
+            if how == 0 and n >= 2:
+                k = int(rng.integers(0, n))
+                offs[j], offs[k] = offs[k], offs[j]
+            elif how == 1:
+                offs[j] = pick([0, L["n_groups"], L["n_groups"] + 1, 0xFFFFFFFF, offs[j] + 1, max(0, offs[j] - 1)])
+            elif how == 2:
+                offs[-1] = pick([L["n_groups"] - 1, L["n_groups"] + 1, 0, 0xFFFFFFFF])
+            elif how == 3:
+                offs[0] = pick([1, 0xFFFFFFFF, L["n_groups"]])
+            else:
+                offs[j] = offs[min(j + 1, n - 1)]
+            for i, v in enumerate(offs):
+                put(L["seg_at"] + 4 * i, "<I", v)
+        else:  # a file with no table: a count that claims one
+            put(OFF["lin_coefs"], "<I", pick([1, 2, L["n_groups"], L["n_groups"] + 1, 0xFFFFFFFF]))
+    else:  # vechead: the two counts at bytes 56 and 60
+        if rng.random() < 0.6:
+            v = L["vec_leaves"]
+            put(
+                OFF["lin_leaves"],
+                "<I",
+                pick([v - 1, v + 1, 0, 1, 2 * v, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFE, 0xFFFFFFFF, int(rng.integers(0, 2**32))]) & 0xFFFFFFFF,
+            )
+        else:
+            v = L["n_segments"]
+            put(
+                OFF["lin_coefs"],
+                "<I",
+                pick([v - 1, v + 1, 0, L["n_groups"], L["n_groups"] + 1, 0x7FFFFFFF, 0xFFFFFFFF, int(rng.integers(0, 2**32))]) & 0xFFFFFFFF,
+            )
+    return refix(b)
 
 
 # ---------------------------------------------------------------------------------------------------------- text / json mutations
@@ -851,18 +977,41 @@ def child_main(args) -> int:
 
 
 # ---------------------------------------------------------------------------------------------------------- bases and the parent
-def build_bases(work: Path) -> list[str]:
-    """Valid flat files of every shape the reader knows, plus a LightGBM text and an xgboost JSON model for the parsers."""
+def build_bases(work: Path, vector_only: bool = False) -> list[str]:
+    """Valid flat files of every shape the reader knows, plus a LightGBM text and an xgboost JSON model for the parsers.
+    `vector_only`: just the format-7 files, which need numpy and nothing else (a node without the model libraries)."""
     import backends
     import qf_common as qf
     import qf_formats
-    import xgboost as xgb
 
     bases = work / "bases"
     bases.mkdir(parents=True, exist_ok=True)
     (work / "tmp").mkdir(exist_ok=True)
     rng = np.random.default_rng(3)
     names = []
+    import dataclasses
+
+    sys.path.insert(0, str(HERE.parent))
+    from vector_forests import make_vector_forest
+
+    for name, forest, options in (
+        ("vec_f32", make_vector_forest(31, width=5, depth=4, trees=6, kind="softmax", folds=2), {}),
+        (
+            "vec_ext64",
+            dataclasses.replace(
+                make_vector_forest(32, width=5, depth=5, trees=5, ext=True, table64=True, folds=2, average="margin"),
+                task="classification",
+                segments=[0, 2, 5],
+            ),
+            {"f64_leaves": True},
+        ),
+        ("vec_cols", make_vector_forest(33, width=3, depth=4, trees=4, kind="sigmoid", folds=2), {}),  # one width-1 segment per column
+    ):
+        backends.get("flat").compile(forest, bases / f"{name}.flat", options)
+        names.append(name)
+    if vector_only:
+        return names
+    import xgboost as xgb
 
     def xgbm(name, obj, nf, rounds, depth, folds=1, **extra):
         d = bases / f"{name}-models"
@@ -1013,7 +1162,9 @@ def make_cases(mode: str, bases: list[str], seed0: int, api_names: list[str]) ->
     cases: dict[str, list[str]] = {"flat": [], "lgb": [], "xgb": [], "npz": [], "choice": [], "api": []}
     for base in bases:
         for kind in KINDS:
-            n = per * (3 if kind in ("multi", "word-fix", "child", "hdr", "trunc") else 1)
+            if kind in VECTOR_KINDS and base not in VECTOR_BASES:
+                continue
+            n = per * (3 if kind in ("multi", "word-fix", "child", "hdr", "trunc", "vecidx", "vectab", "seg", "vechead") else 1)
             cases["flat"] += [f"flat:{base}:{kind}:{seed0 + s}" for s in range(n)]
     n_text = 150 if mode == "quick" else 6000
     cases["lgb"] = [f"lgb:{b}:text:{seed0 + s}" for b in ("lgb_cat.txt", "lgb_linear.txt", "lgb_multi.txt") for s in range(n_text)]
@@ -1077,6 +1228,9 @@ def main() -> int:
     ap.add_argument("--seed0", type=int, default=1)
     ap.add_argument("--out", default=str(HERE / "out"))
     ap.add_argument("--only", default=None, help="comma list of targets: flat,lgb,xgb,npz,choice,api")
+    ap.add_argument(
+        "--vector-only", action="store_true", help="the flat target on the format-7 bases only (needs numpy, no model libraries)"
+    )
     ap.add_argument("--replay", default=None, help="target:base:kind:seed -> write the mutated file into --out and load it")
     ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--work", default=None, help=argparse.SUPPRESS)
@@ -1091,7 +1245,9 @@ def main() -> int:
         (out / "findings.txt").unlink()
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
-    bases = build_bases(work)
+    bases = build_bases(work, args.vector_only)
+    if args.vector_only:
+        args.only = "flat"
     if args.replay:
         tgt, base, kind, seed = args.replay.split(":")
         if tgt == "flat":

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "scripts"))
@@ -40,6 +41,26 @@ class CountNodesTest(unittest.TestCase):
 
         self.assertEqual(sorted(bench_e2e.SIZES), ["readme", "small"])
         self.assertEqual(bench_e2e.SIZES["readme"]["trees"], 67)  # the size behind the figures in bench/README-NUMBERS.md
+
+
+class CompareBuildsQF10ByDefault(unittest.TestCase):
+    """README-NUMBERS.md's figures are QF 1.0's build: `common.compare` must ask compare.py for it, not take the library's (1.1) default build."""
+
+    def cmd(self, **kw):
+        import common as c
+
+        seen = []
+        with mock.patch.object(c, "run", lambda cmd, log=None: seen.append(list(cmd)) or 0.0):
+            c.compare(Path("m"), Path("d.npz"), Path("w"), "flat", Path("t.json"), stage="build", **kw)
+        (cmd,) = seen
+        return [cmd[i + 1] for i, a in enumerate(cmd) if a == "--opt"]
+
+    def test_the_default_is_the_1_0_preset(self):
+        self.assertEqual(self.cmd(), ["compile_preset=1.0"])
+
+    def test_it_can_be_overridden(self):
+        self.assertEqual(self.cmd(opts=()), [])
+        self.assertEqual(self.cmd(opts=("shape=fast", "compile_preset=1.0")), ["shape=fast", "compile_preset=1.0"])
 
 
 class TrainedModelsAreReusedOnlyForTheSameTraining(unittest.TestCase):

@@ -278,7 +278,19 @@ class DataAndChoiceFilesTest(unittest.TestCase):
             got = qf.load_data(self.t / "ok.npz")[name]
             self.assertEqual(got.shape, (n,), name)
             self.assertTrue(np.array_equal(got, good), name)
-            for bad in (col[:-1], np.zeros((n, 2)), np.zeros((n, 1, 1)), np.float64(3.0), np.zeros((1, n))):
+            if (
+                name == "y"
+            ):  # (rows, K) is the truth of a K-output model: load_data lets it through, the model's width is checked where y is used
+                np.savez(self.t / "ok.npz", X=x, y=np.zeros((n, 2)))
+                self.assertEqual(qf.load_data(self.t / "ok.npz")["y"].shape, (n, 2))
+                qf.require_truth_columns(np.zeros((n, 2)), 2, "d.npz")
+                qf.require_truth_columns(np.zeros((n, 1)), 1, "d.npz")
+                qf.require_truth_columns(np.zeros(n), 1, "d.npz")
+                for y_bad, n_out in ((np.zeros((n, 2)), 1), (np.zeros(n), 2), (np.zeros((n, 3)), 2)):
+                    with self.assertRaisesRegex(ValueError, "y has .* column"):
+                        qf.require_truth_columns(y_bad, n_out, "d.npz")
+            wrong_shapes = (col[:-1], np.zeros((n, 1, 1)), np.float64(3.0), np.zeros((1, n)))
+            for bad in wrong_shapes if name == "y" else (col[:-1], np.zeros((n, 2)), *wrong_shapes[1:]):
                 np.savez(self.t / "bad.npz", X=x, **{name: bad})
                 with self.subTest(name=name, shape=np.shape(bad)), self.assertRaises(ValueError) as cm:
                     qf.load_data(self.t / "bad.npz")
@@ -1122,7 +1134,7 @@ class RefusedInputsTest(unittest.TestCase):
         self.assertIn("nosuch", cli_message(optimize.main, [*base, "--backend", "nosuch", "--compile", "--out", str(self.t / "o2")]))
         self.assertIn("threshold", cli_message(optimize.main, [*base, "--decision", "threshold:abc", "--out", str(self.t / "o3")]))
         self.assertIn(
-            "single output",
+            "one probability column",
             cli_message(
                 optimize.main,
                 [str(self.multi), "--data", str(self.t / "d.npz"), "--decision", "threshold:0.5", "--out", str(self.t / "o4")],
@@ -1139,7 +1151,7 @@ class RefusedInputsTest(unittest.TestCase):
             cli_message(prune.main, [str(self.binary), str(self.t / "d.npz"), str(self.t / "p1"), "--decision", "threshold:abc"]),
         )
         self.assertIn(
-            "single output",
+            "one probability column",
             cli_message(prune.main, [str(self.multi), str(self.t / "d.npz"), str(self.t / "p2"), "--decision", "threshold:0.5"]),
         )
 
@@ -1524,6 +1536,57 @@ class ValidatedInputsTest(unittest.TestCase):
             compile.compile_model(FIX / "xgb_reg.json", Path(folder) / "m.flat", backend="flat")
         self.assertEqual(os.listdir(folder), [])
         self.assertIn("UTF-8", cli_message(compile.main, [str(FIX / "xgb_reg.json"), str(Path(folder) / "m.flat")]))
+
+
+class VectorFileRefusalsTest(unittest.TestCase):
+    """QuickForest 1.2 (format 7): what a vector file may not be read as, and where it may not be compiled."""
+
+    def setUp(self):
+        sys.path.insert(0, str(HERE))
+        from vector_forests import make_vector_forest
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.t = Path(self.tmp.name)
+        self.forest = make_vector_forest(7, width=3, depth=3, trees=3)
+        self.path = self.t / "v.flat"
+        backends.get("flat").compile(self.forest, self.path, {})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_newer_format_or_an_unknown_flag_bit_is_refused_as_written_by_a_newer_version(self):
+        blob = self.path.read_bytes()
+        flags = int.from_bytes(blob[48:52], "little")
+        for what, at, value in (("format 8", 8, 8), ("flag bit 6", 48, flags | 64), ("flag bit 31", 48, flags | 1 << 31)):
+            damaged = bytearray(blob)
+            damaged[at : at + 4] = value.to_bytes(4, "little")
+            bad = self.t / "newer.flat"
+            bad.write_bytes(evaluator.seal(damaged))
+            with self.subTest(what), self.assertRaises(ValueError) as cm:
+                evaluator.FlatForest(bad)
+            self.assertIn("newer version", str(cm.exception))
+
+    def test_a_vector_forest_is_refused_by_the_wave_backend_before_anything_is_written(self):
+        import compile as qf_compile
+
+        out = self.t / "m.wave"
+        with mock.patch.object(qf_compile.qf, "load_forest", return_value=self.forest):
+            with self.assertRaises(ValueError) as cm:
+                qf_compile.compile_model(FIX / "xgb_reg.json", out, backend="wave")
+        self.assertIn("vector_leaves", str(cm.exception))
+        self.assertFalse(out.exists())
+
+    def test_the_wavefront_engines_refuse_a_format_7_file_in_words(self):
+        try:
+            evaluator.FlatForest(self.path).close()
+        except ValueError:
+            self.skipTest("the evaluator library at hand does not read format 7")
+        for engine in (1, 2):
+            fo = evaluator.FlatForest(self.path, engine=engine)
+            self.addCleanup(fo.close)
+            with self.subTest(engine=engine), self.assertRaises(evaluator.EngineRefused) as cm:
+                fo.predict(np.zeros((4, self.forest.n_features), np.float32))
+            self.assertIn("vector leaves", str(cm.exception))
 
 
 if __name__ == "__main__":

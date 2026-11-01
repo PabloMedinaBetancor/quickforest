@@ -29,6 +29,7 @@ import optimize
 import prune
 import qf_common as qf
 import qf_formats
+import qf_ydf
 
 HAS_YDF = importlib.util.find_spec("ydf") is not None
 TOL = 1e-6
@@ -368,7 +369,7 @@ class OutputFieldsTest(unittest.TestCase):
                 2,
             )
             b.save_model(str(self.t / f"x_{strategy}.json"))
-            cases.append((f"two targets, {strategy}", "refused", self.t / f"x_{strategy}.json"))
+            cases.append((f"two targets, {strategy}", "read", self.t / f"x_{strategy}.json"))
         self.check_cases(cases)
 
     def test_xgboost_dart_is_refused_by_what_the_file_says_under_every_layout(self):
@@ -908,7 +909,318 @@ class YdfTest(unittest.TestCase):
         self.assertIsNone(out["compile_unsupported"])
         self.assertTrue(out["stages"]["verify"]["ok"], out["stages"]["verify"])
         self.assertTrue((self.t / "o2" / "pruned" / "rm").is_dir())
-        self.assertEqual(len(qf_formats.open_source(self.t / "o2" / "pruned" / "rm").irs), 3 * 9)
+        self.assertEqual(
+            len(qf_formats.open_source(self.t / "o2" / "pruned" / "rm").irs), 9
+        )  # one vector tree per YDF tree, not one per class
+
+
+def f32_margin(ir, x, tree_info=None):
+    """xgboost's own arithmetic on the neutral trees: the base margin, then every tree's leaf added in float32, in tree order."""
+    marg = np.tile(ir.base, (len(x), 1)).astype(np.float32)
+    for i, t in enumerate(ir.trees):
+        if t.vector is not None:
+            marg = marg + qf.tree_values(t, x)
+        else:
+            marg[:, int(tree_info[i])] = marg[:, int(tree_info[i])] + qf.tree_values(t, x)
+    return marg
+
+
+class XgbVectorLeavesTest(unittest.TestCase):
+    """`multi_strategy=multi_output_tree` models: the leaf vectors come from `leaf_weights` (indexed by the leaf index that `right_children`
+    holds at a leaf); margins equal booster.predict bit for bit; every file that does not hold together is one refusal line."""
+
+    @classmethod
+    def setUpClass(cls):
+        import xgboost as xgb
+
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.t = Path(cls.tmp.name)
+        rng = np.random.default_rng(3)
+        cls.x = rng.normal(size=(500, 6)).astype(np.float32)
+        cls.x[rng.random(cls.x.shape) < 0.06] = np.nan
+        z = np.nan_to_num(cls.x)
+        cls.y = np.stack([z[:, 0] * 3 + z[:, 1], z[:, 2] - 2 * z[:, 3], z[:, 4] * z[:, 5], z[:, 0] - z[:, 4], z[:, 1] * 2], 1)
+        cls.models = {}
+        base = {"tree_method": "hist", "max_depth": 4, "nthread": 1, "seed": 0}
+        specs = {
+            "reg_k2": ({"objective": "reg:squarederror"}, cls.y[:, :2]),
+            "reg_k5": ({"objective": "reg:squarederror"}, cls.y),
+            "multilabel_k3": ({"objective": "binary:logistic"}, (cls.y[:, :3] > 0).astype(int)),
+            "softprob_c3": ({"objective": "multi:softprob", "num_class": 3}, np.digitize(z[:, 0], [-0.5, 0.5])),
+        }
+        for name, (params, y) in specs.items():
+            b = xgb.train({**base, **params, "multi_strategy": "multi_output_tree"}, xgb.DMatrix(cls.x, y), 6)
+            path = cls.t / f"{name}.ubj"
+            b.save_model(str(path))
+            cls.models[name] = (b, path)
+        k1 = xgb.train({**base, "objective": "reg:squarederror", "multi_strategy": "multi_output_tree"}, xgb.DMatrix(cls.x, cls.y[:, 0]), 6)
+        k1.save_model(str(cls.t / "k1.ubj"))
+        cls.models["k1"] = (k1, cls.t / "k1.ubj")
+        cls.xgb = xgb
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def margin(self, name):
+        b, path = self.models[name]
+        src = qf_formats.open_source(path)
+        ref = b.predict(self.xgb.DMatrix(self.x), output_margin=True).reshape(len(self.x), -1)
+        return src, ref, f32_margin(src.model_ir(), self.x, src.spec.tree_info)
+
+    def test_margins_equal_the_boosters_bit_for_bit(self):
+        for name in ("reg_k2", "reg_k5", "multilabel_k3", "softprob_c3"):
+            src, ref, got = self.margin(name)
+            np.testing.assert_array_equal(ref, got, name)
+            self.assertEqual(src.spec.vector_width, src.spec.groups, name)
+            self.assertTrue(set(src.spec.tree_info) == {0}, name)
+            forest = qf.Forest(src.spec.n_features, src.spec.groups, src.spec.kind, "output", [src.model_ir()], src.spec.task)
+            qf.check_vector(forest)
+            self.assertIn("vector_leaves", forest.requires, name)
+
+    def test_the_objectives_become_the_right_groups_and_transforms(self):
+        want = {"reg_k2": (2, "identity"), "reg_k5": (5, "identity"), "multilabel_k3": (3, "sigmoid"), "softprob_c3": (3, "softmax")}
+        for name, (groups, kind) in want.items():
+            src = qf_formats.open_source(self.models[name][1])
+            self.assertEqual((src.spec.groups, src.spec.kind), (groups, kind), name)
+            forest = qf.Forest(src.spec.n_features, groups, kind, "output", [src.model_ir()], src.spec.task)
+            self.assertLessEqual(rel_err(src.predict(self.x), qf.ir_predict(forest, self.x)), TOL, name)
+
+    def test_a_vector_base_score_is_read_per_output(self):
+        src = qf_formats.open_source(self.models["reg_k5"][1])
+        self.assertEqual(len(src.spec.base), 5)
+        self.assertTrue(len(set(src.spec.base.tolist())) > 1)
+
+    def test_a_pruned_vector_model_is_a_valid_xgboost_model_with_the_same_answers(self):
+        for name in ("reg_k2", "multilabel_k3", "softprob_c3"):
+            src = qf_formats.open_source(self.models[name][1])
+            kept = np.array([0, 2, 5])
+            dest = self.t / f"pruned_{name}.json"
+            src.save_pruned([kept] * src.spec.groups, False, dest)
+            pb = self.xgb.Booster()
+            pb.load_model(str(dest))
+            ref = pb.predict(self.xgb.DMatrix(self.x), output_margin=True).reshape(len(self.x), -1)
+            small = qf_formats.open_source(dest)
+            self.assertEqual(len(small.model_ir().trees), 3, name)
+            np.testing.assert_array_equal(ref, f32_margin(small.model_ir(), self.x), name)
+            np.testing.assert_array_equal(  # and they are the kept trees of the original, in that order
+                f32_margin(small.model_ir(), self.x),
+                f32_margin(qf.ModelIR(src.spec.base, [src.model_ir().trees[i] for i in kept]), self.x),
+                name,
+            )
+
+    def test_a_random_forest_style_vector_model_is_rescaled_when_pruned(self):
+        b = self.xgb.train(
+            {"objective": "reg:squarederror", "tree_method": "hist", "multi_strategy": "multi_output_tree", "num_parallel_tree": 4, "subsample": 0.7,
+             "learning_rate": 1, "max_depth": 3, "nthread": 1},
+            self.xgb.DMatrix(self.x, self.y[:, :2]),
+            1,
+        )  # fmt: skip
+        path = self.t / "rf2.ubj"
+        b.save_model(str(path))
+        src = qf_formats.open_source(path)
+        self.assertTrue(src.spec.rf)
+        dest = self.t / "rf2_pruned.json"
+        src.save_pruned([np.array([0, 1])] * 2, True, dest)
+        pb = self.xgb.Booster()
+        pb.load_model(str(dest))
+        small = qf_formats.open_source(dest)
+        np.testing.assert_array_equal(
+            pb.predict(self.xgb.DMatrix(self.x), output_margin=True).reshape(len(self.x), -1), f32_margin(small.model_ir(), self.x)
+        )
+
+    def test_leaf_codes_and_vectors_rebuild_the_boosters_margin_bit_for_bit(self):
+        for name in ("reg_k5", "softprob_c3"):
+            src, ref, _ = self.margin(name)
+            codes, tables = src.leaf_codes(self.x, chunk=128), src.leaf_vectors()
+            marg = np.tile(src.spec.base, (len(self.x), 1)).astype(np.float32)
+            for i, table in enumerate(tables):
+                marg = marg + table[codes[i]]
+            np.testing.assert_array_equal(ref, marg, name)
+        with self.assertRaises(ValueError):
+            qf_formats.open_source(self.models["k1"][1]).leaf_codes(self.x)
+
+    def test_a_one_output_model_under_multi_output_tree_stays_scalar_trees(self):
+        src, ref, _ = self.margin("k1")
+        self.assertEqual((src.spec.groups, src.spec.vector_width), (1, 0))
+        self.assertTrue(all(t.vector is None for t in src.model_ir().trees))
+        np.testing.assert_array_equal(ref, f32_margin(src.model_ir(), self.x, src.spec.tree_info))
+
+    def edited(self, label, change, name="reg_k2"):
+        doc = json.loads(self.models[name][0].save_raw("json"))
+        change(doc)
+        path = self.t / f"edited-{label}.json"
+        path.write_text(json.dumps(doc))
+        return path
+
+    def test_every_vector_file_that_does_not_hold_together_is_one_refusal_line(self):
+        def trees(doc):
+            return doc["learner"]["gradient_booster"]["model"]["trees"]
+
+        def leaf_of(tree):
+            return next(i for i, lc in enumerate(tree["left_children"]) if lc == -1)
+
+        def class_and_target(doc):
+            doc["learner"]["learner_model_param"]["num_class"] = "3"
+
+        def width_differs(doc):
+            trees(doc)[1]["tree_param"]["size_leaf_vector"] = "3"
+
+        def index_out_of_range(doc):
+            t = trees(doc)[0]
+            t["right_children"][leaf_of(t)] = 999
+
+        def index_used_twice(doc):
+            t = trees(doc)[0]
+            leaves = [i for i, lc in enumerate(t["left_children"]) if lc == -1]
+            t["right_children"][leaves[1]] = t["right_children"][leaves[0]]
+
+        def short_weights(doc):
+            trees(doc)[0]["leaf_weights"] = trees(doc)[0]["leaf_weights"][:-2]
+
+        def stores_differ(doc):
+            t = trees(doc)[0]
+            t["base_weights"][leaf_of(t) * 2] += 0.5
+
+        def reduced_gradient(doc):
+            t = trees(doc)[0]
+            t["base_weights"] = t["base_weights"][: len(t["base_weights"]) // 2]
+
+        def nan_weight(doc):
+            t = trees(doc)[0]
+            t["leaf_weights"][0] = float("nan")
+            t["base_weights"][leaf_of(t) * 2] = float("nan")
+
+        for change in (
+            class_and_target,
+            width_differs,
+            index_out_of_range,
+            index_used_twice,
+            short_weights,
+            stores_differ,
+            reduced_gradient,
+            nan_weight,
+        ):
+            path = self.edited(change.__name__, change)
+            with self.assertRaises(ValueError, msg=change.__name__) as cm:
+                qf_formats.open_source(path)
+            self.assertNotIn("\n", str(cm.exception), change.__name__)
+
+    def test_a_base_score_vector_of_the_wrong_length_is_refused(self):
+        def many(doc):
+            doc["learner"]["learner_model_param"]["base_score"] = "[1E-1,2E-1,3E-1]"
+
+        with self.assertRaisesRegex(ValueError, "base_score"):
+            qf_formats.open_source(self.edited("many", many))
+
+
+@unittest.skipUnless(HAS_YDF, "ydf is not installed")
+class YdfVectorTest(unittest.TestCase):
+    """A multi-class YDF random forest is one vector tree per YDF tree; the 1.1 layout (one scalar tree per class) stays behind the bench
+    switch, and the two answer bit for bit alike. A binary forest is unchanged."""
+
+    @classmethod
+    def setUpClass(cls):
+        import ydf
+
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.t = Path(cls.tmp.name)
+        _, x, f = data(520, n=900, nf=6)
+        cls.d = {f"f{i}": x[:, i] for i in range(6)}
+        cls.x = x
+        z = np.nan_to_num(f)
+        cls.paths = {}
+        for tag, y, wta in (
+            ("c3_wta", np.digitize(z, [0.0, 3.0]), True),
+            ("c3_avg", np.digitize(z, [0.0, 3.0]), False),
+            ("c2", (z > 1).astype(int), True),
+        ):
+            m = ydf.RandomForestLearner(
+                label="y", task=ydf.Task.CLASSIFICATION, num_trees=14, max_depth=5, winner_take_all=wta, random_seed=1
+            ).train({**cls.d, "y": y.astype(str)}, verbose=0)
+            cls.paths[tag] = cls.t / tag
+            m.save(str(cls.paths[tag]))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def forest(self, tag, replicate=False):
+        with mock.patch.object(qf_ydf, "REPLICATE_CLASSES", replicate):
+            return qf.load_forest([self.paths[tag]])
+
+    def test_one_vector_tree_per_ydf_tree_answers_the_replicated_forest_bit_for_bit(self):
+        for tag in ("c3_wta", "c3_avg"):
+            vec, rep = self.forest(tag), self.forest(tag, True)
+            self.assertEqual((vec.n_trees, rep.n_trees, vec.groups), (14, 14 * 3, 3), tag)
+            self.assertTrue({"vector_leaves", "sum64"} <= vec.requires and "vector_leaves" not in rep.requires, tag)
+            x = make_rows(vec, np.random.default_rng(1))[:, :6]
+            np.testing.assert_array_equal(qf.ir_predict(vec, x), qf.ir_predict(rep, x), tag)
+            src = qf_formats.open_source(self.paths[tag])
+            self.assertLessEqual(rel_err(src.predict(x), qf.ir_predict(vec, x)), TOL, tag)
+            self.assertEqual((src.spec.vector_width, set(src.spec.tree_info)), (3, {0}), tag)
+
+    def test_a_binary_forest_keeps_its_scalar_trees(self):
+        f = self.forest("c2")
+        self.assertEqual((f.groups, f.n_trees), (1, 14))
+        self.assertTrue(all(t.vector is None and t.group == 0 for t in f.models[0].trees))
+        self.assertNotIn("vector_leaves", f.requires)
+        self.assertEqual(qf_formats.open_source(self.paths["c2"]).spec.vector_width, 0)
+
+    def test_a_pruned_ydf_model_holds_the_kept_vector_trees(self):
+        import ydf
+
+        src = qf_formats.open_source(self.paths["c3_wta"])
+        kept = np.array([1, 4, 5, 9])
+        dest = self.t / "pruned"
+        src.save_pruned([kept] * 3, True, dest)
+        small = qf_formats.open_source(dest)
+        self.assertEqual(len(small.irs), 4)
+        self.assertEqual(len(ydf.load_model(str(dest)).get_all_trees()), 4)
+        # the model's own answer is the mean over the kept trees: the shares are divided by 4 now, not by 14
+        mine = qf.ir_predict(qf.load_forest([dest]), self.x)
+        self.assertLessEqual(rel_err(small.predict(self.x), mine), TOL)
+
+    def test_leaf_codes_and_vectors_rebuild_the_forest_answer(self):
+        src = qf_formats.open_source(self.paths["c3_avg"])
+        codes, tables = src.leaf_codes(self.x[:150]), src.leaf_vectors()
+        total = sum(tables[i][codes[i]].astype(np.float64) for i in range(len(tables)))
+        self.assertLessEqual(rel_err(src.predict(self.x[:150]), total), TOL)
+        with self.assertRaises(ValueError):
+            src.leaf_matrix(self.x[:10])
+
+
+class K1ByteIdentityTest(unittest.TestCase):
+    """The K = 1 files of 1.2 are the bytes 1.1 wrote (fixtures built from the pre-1.2 commit by tests/make_multi_fixtures.py)."""
+
+    FIX = Path(__file__).resolve().parent / "fixtures" / "multi"
+
+    def compiled_sha(self, model, tmp):
+        import hashlib
+
+        out = Path(tmp) / "m.flat"
+        compile.compile_model(model, out, backend="flat")
+        return hashlib.sha256(out.read_bytes()).hexdigest()
+
+    def test_k1_models_compile_to_the_bytes_of_1_1(self):
+        cases = [("k1_xgb_mot_model.ubj", "k1_xgb_mot"), ("k1_xgb_oopt_model.ubj", "k1_xgb_oopt")]
+        if HAS_YDF and (self.FIX / "ydf_rf_binary").is_dir():
+            cases.append(("ydf_rf_binary", "k1_ydf_rf_binary"))
+        with tempfile.TemporaryDirectory() as tmp:
+            for model, tag in cases:
+                want = (self.FIX / f"{tag}.sha256").read_text().split()[0]
+                if not (self.FIX / model).exists():
+                    self.skipTest(f"{model} is a fixture to regenerate (tests/make_multi_fixtures.py --group k1)")
+                self.assertEqual(self.compiled_sha(self.FIX / model, tmp), want, tag)
+
+    @unittest.skipUnless(HAS_YDF, "ydf is not installed")
+    def test_the_replicated_switch_compiles_the_3_class_forest_to_the_bytes_of_1_1(self):
+        model = self.FIX / "ydf_rf_c3"
+        if not model.is_dir():
+            self.skipTest("ydf_rf_c3 is a fixture to regenerate (tests/make_multi_fixtures.py --group ydf)")
+        want = (self.FIX / "k1_ydf_rf_c3_replicated.sha256").read_text().split()[0]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(qf_ydf, "REPLICATE_CLASSES", True):
+            self.assertEqual(self.compiled_sha(model, tmp), want)
 
 
 if __name__ == "__main__":

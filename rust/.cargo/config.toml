@@ -1,0 +1,4 @@
+# QuickForest standard build (docs/BUILD-STANDARD.md, rule 1): fat LTO and codegen-units 16 (all threads) are in Cargo.toml [profile.release]; the inline threshold is a
+# rustc flag, so it lives here. build.sh unsets RUSTFLAGS on purpose (a user's flags must not change the shipped library), which leaves this file in force.
+[build]
+rustflags = ["-C", "llvm-args=-inline-threshold=3000"]

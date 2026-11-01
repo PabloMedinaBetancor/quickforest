@@ -421,9 +421,9 @@ class PipelineTest(unittest.TestCase):
         rules = []
         real = check.compare
 
-        def spy(name, ref, got, decision, rule, groups, absolute=False, exact=False):
+        def spy(name, ref, got, decision, rule, groups, absolute=False, exact=False, segments=None):
             rules.append(rule)
-            return real(name, ref, got, decision, rule, groups, absolute, exact)
+            return real(name, ref, got, decision, rule, groups, absolute, exact, segments=segments)
 
         with mock.patch.object(check, "compare", spy):
             t = compare.run_table(
@@ -451,9 +451,9 @@ class PipelineTest(unittest.TestCase):
         seen = []
         real = check.compare
 
-        def spy(name, ref, got, decision, rule, groups, absolute=False, exact=False):
+        def spy(name, ref, got, decision, rule, groups, absolute=False, exact=False, segments=None):
             seen.append(exact)
-            return real(name, ref, got, decision, rule, groups, absolute, exact)
+            return real(name, ref, got, decision, rule, groups, absolute, exact, segments=segments)
 
         with mock.patch.object(check, "compare", spy):
             compare.run_table(
@@ -1664,6 +1664,192 @@ class DeepTreeTest(unittest.TestCase):
         self.assertIn("levels", skipped.get("codegen-block", ""))
         names, _ = choose.candidates(self.spine_forest(5))
         self.assertTrue(set(names) & {"flat"}, names)
+
+
+MULTI = Path(__file__).resolve().parent / "fixtures" / "multi"
+
+
+def require_joblib(path):
+    """The large sklearn pickles are git-ignored: skip, with the command that makes them, when absent."""
+    if not path.exists():
+        raise unittest.SkipTest(f"{path.name} is not in the checkout: run  python tests/make_multi_fixtures.py --group sklearn")
+
+
+def vector_stack_ready() -> bool:
+    """The multi-output tests need the sklearn reader (P2), the vector flat writer and the Rust loader (P1); until they have landed they skip."""
+    try:
+        import qf_sklearn  # noqa: F401
+        import sklearn  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+class K1PrunePinTest(unittest.TestCase):
+    """A K = 1 run of 1.2 reproduces 1.1's `prune.py` report key for key (W0-FIX pins, same seed 15). The data is rebuilt as the generator built it."""
+
+    @staticmethod
+    def stripped(report: dict):
+        import make_multi_fixtures as m
+
+        return json.dumps(m.strip_volatile(report), indent=1, sort_keys=True, default=str) + "\n"
+
+    def run_pin(self, tag, model, data, extra):
+        with tempfile.TemporaryDirectory() as d:
+            dst = Path(d) / "out"
+            rep = prune.run(model, data, dst, **extra)
+            rep = json.loads((dst / "report.json").read_text())
+            self.assertEqual(self.stripped(rep), (MULTI / f"prune_pin_{tag}.json").read_text(), tag)
+
+    def test_xgboost_regression_pins(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bench"))
+        import make_multi_fixtures as m
+
+        xt = m.features(m.ROWS_TRAIN, 100, 0.04)
+        yt = m.targets(xt, 1, 200)[:, 0]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            np.savez(d / "sel.npz", X=xt[:1500], y=yt[:1500].astype(np.float64))
+            model = d / "xgb_oopt_k1.ubj"  # the name the pin was made under
+            model.write_bytes((MULTI / "k1_xgb_oopt_model.ubj").read_bytes())
+            for tag, space in (("reg_raw", "raw"), ("reg_log", "log")):
+                self.run_pin(tag, model, d / "sel.npz", {"keep": "30%", "regression": qf.RegBar(space)})
+
+    @unittest.skipUnless((MULTI / "ydf_rf_binary").is_dir(), "the binary YDF fixture is not here")
+    def test_binary_ydf_random_forest_pin(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bench"))
+        import common as c
+
+        xb, _ = c.make_data(6000, 42, 3, 7)
+        with tempfile.TemporaryDirectory() as d:
+            np.savez(Path(d) / "clf.npz", X=xb[:3000])
+            self.run_pin("clf_binary_rf", MULTI / "ydf_rf_binary", Path(d) / "clf.npz", {"keep": "30%", "decision": "argmax"})
+
+
+@unittest.skipUnless(vector_stack_ready(), "needs the sklearn reader (P2) and the vector flat writer / loader (P1)")
+class MultiOutputPruneTest(unittest.TestCase):
+    """DISENO 6, done-test of part P4. Synthetic data only: LIMITS says pruning of multi-output forests is measured on synthetic data."""
+
+    @staticmethod
+    def load(name):
+        import joblib  # test-only: QF itself never reads a pickle
+        import qf_sklearn
+
+        require_joblib(MULTI / f"{name}.joblib")
+        est = joblib.load(MULTI / f"{name}.joblib")
+        x = np.load(MULTI / f"{name}.npz")["x"]
+        tmp = tempfile.mkdtemp(prefix="qf-multi-")
+        path = Path(tmp) / f"{name}.qfsk"
+        qf_sklearn.export_sklearn(est, path, X=x[:500])
+        return est, x, path
+
+    def test_regressor_k5_raw_every_output_passes_and_the_kept_list_is_one(self):
+        _est, x, path = self.load("rf_reg_k5")
+        with tempfile.TemporaryDirectory() as d:
+            np.savez(Path(d) / "data.npz", X=x)
+            # rf_reg_k5 has outputs near zero, so a relative bar is loose here: the default 0.5 % median does not hold for 30 % of the trees
+            # (measured 1.0-9.7 %, the auto ladder keeps the whole forest), and the test is about the bar being judged per output
+            bar = qf.RegBar("raw", median_pct=12.0, max_pct=1e9)
+            rep = prune.run(path, Path(d) / "data.npz", Path(d) / "out", "30%", regression=bar)
+        reg = rep["regression"]
+        self.assertEqual(len(reg["per_output"]), 5)
+        self.assertTrue(all(o["median_pct"] <= 12.0 for o in reg["per_output"]), reg["per_output"])
+        self.assertTrue(reg["ok"], reg)
+        self.assertGreater(max(o["median_pct"] for o in reg["per_output"]), 0.5)  # the default bar would have refused this prune
+        per_group = rep["kept_indices"][path.name]["per_group"]
+        self.assertTrue(all(g == per_group[0] for g in per_group))
+        self.assertEqual(reg["median_pct"], max(o["median_pct"] for o in reg["per_output"]))
+
+    def test_classifier_3_and_2_classes_auto(self):
+        _est, x, path = self.load("rf_clf_k2_c3_2")
+        with tempfile.TemporaryDirectory() as d:
+            np.savez(Path(d) / "data.npz", X=x)
+            rep = prune.run(path, Path(d) / "data.npz", Path(d) / "out", "auto", decision="argmax", min_agreement=95.0)
+        h = rep["heldout"]
+        self.assertEqual(len(h["agreement_pct_per_output"]), 2)
+        self.assertLessEqual(h["all_outputs_pct"], min(h["agreement_pct_per_output"]))
+        if not rep["auto"]["chosen"]["whole_forest"]:
+            self.assertTrue(all(a >= 95.0 for a in h["agreement_pct_per_output"]))
+
+    def test_xgboost_multilabel_k2_half_of_the_trees_exact_pruned_model(self):
+        import xgboost as xgb
+
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            x = np.load(MULTI / "xgb_vec_multilabel_k2.npz")["x"]
+            np.savez(d / "data.npz", X=x)
+            rep = prune.run(MULTI / "xgb_vec_multilabel_k2.ubj", d / "data.npz", d / "out", "50%")
+            self.assertEqual(len(rep["heldout"]["agreement_pct_per_output"]), 2)  # a sigmoid column decides on its own: p >= 0.5
+            booster = xgb.Booster()
+            booster.load_model(str(d / "out" / "xgb_vec_multilabel_k2.ubj"))  # a valid xgboost file holding the kept trees
+            kept = rep["kept_indices"]["xgb_vec_multilabel_k2.ubj"]["per_group"][0]
+            self.assertEqual(rep["models"][0]["kept_trees"], len(kept))
+            self.assertEqual(booster.predict(xgb.DMatrix(x)).shape, (len(x), 2))
+
+    def test_refusals(self):
+        _est, x, path = self.load("rf_reg_k5")
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            np.savez(d / "wide.npz", X=x, y=np.zeros(len(x)))
+            with self.assertRaisesRegex(SystemExit, "y has 1 column"):
+                prune.run(path, d / "wide.npz", d / "o1", "30%", regression=qf.RegBar("raw"))
+            _, xc, clf = self.load("rf_clf_k2_c3_2")
+            np.savez(d / "c.npz", X=xc)
+            with self.assertRaisesRegex(SystemExit, "regression bar needs a regression model"):
+                prune.run(clf, d / "c.npz", d / "o2", "30%", regression=qf.RegBar("raw"))
+            _, xm, ml = None, np.load(MULTI / "xgb_vec_multilabel_k2.npz")["x"], MULTI / "xgb_vec_multilabel_k2.ubj"
+            np.savez(d / "m.npz", X=xm)
+            with self.assertRaisesRegex(ValueError, "single output"):
+                prune.run(ml, d / "m.npz", d / "o3", "50%", decision="threshold:0.5")
+            _, xd, dt = self.load("dt_reg_k2")
+            np.savez(d / "d.npz", X=xd)
+            with self.assertRaisesRegex(SystemExit, "single decision tree"):
+                prune.run(dt, d / "d.npz", d / "o4", "30%", regression=qf.RegBar("raw"))
+
+
+@unittest.skipUnless(vector_stack_ready(), "needs the sklearn reader (P2) and the vector flat writer / loader (P1)")
+class ApiTest(unittest.TestCase):
+    """DISENO 7, done-test of part P4: a fitted estimator in, split outputs out."""
+
+    def test_regressor_k3_optimize_from_the_estimator(self):
+        import joblib
+
+        require_joblib(MULTI / "et_reg_k3.joblib")
+        est = joblib.load(MULTI / "et_reg_k3.joblib")
+        x = np.load(MULTI / "et_reg_k3.npz")["x"]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            np.savez(d / "data.npz", X=x)
+            rep = optimize.optimize(
+                est, d / "data.npz", d / "out", keep="auto", compile_=True, verify=True, regression=qf.RegBar("raw"), backend="flat"
+            )
+            self.assertTrue(rep["ok"], rep.get("failures"))
+            self.assertEqual(rep["library_diff"], 0.0)
+            self.assertTrue((d / "out" / "model.qfsk").exists())
+            forest = evaluator.FlatForest(rep["stages"]["compile"]["artifact"])
+            self.assertEqual(forest.n_outputs, 3)
+            for k, col in enumerate(forest.split_outputs(forest.predict(x))):
+                np.testing.assert_allclose(col, est.predict(x)[:, k], rtol=1e-6, atol=1e-6)
+
+    def test_classifier_k2_split_outputs_equal_predict_proba(self):
+        import joblib
+
+        est = joblib.load(MULTI / "rf_clf_k2_c3_2.joblib")
+        x = np.load(MULTI / "rf_clf_k2_c3_2.npz")["x"]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            np.savez(d / "data.npz", X=x)
+            rep = optimize.optimize(est, d / "data.npz", d / "out", keep="100%", compile_=True, verify=True, backend="flat")
+            self.assertTrue(rep["ok"], rep.get("failures"))
+            forest = evaluator.FlatForest(rep["stages"]["compile"]["artifact"])
+            for got, want in zip(forest.split_outputs(forest.predict(x)), est.predict_proba(x), strict=True):
+                np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6)
+            self.assertEqual(forest.argmax_outputs(forest.predict(x)).shape, (len(x), 2))
+
+    def test_an_old_file_has_one_output_and_no_segments(self):
+        flat = MULTI / "k1_xgb_oopt.flat"
+        forest = evaluator.FlatForest(flat)
+        self.assertEqual((forest.n_outputs, forest.segments), (1, None))
 
 
 if __name__ == "__main__":

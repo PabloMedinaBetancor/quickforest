@@ -1,0 +1,236 @@
+{
+ "info": {
+  "title": "evaluator inline-threshold 3000",
+  "machine": "x86_64",
+  "cpu": "Intel(R) Celeron(R) N4020 CPU @ 1.10GHz",
+  "logical_cpus": 2,
+  "os": "Linux 6.8.0-138-generic",
+  "threads_used": 1,
+  "baseline": "the source library's own predict, 1 thread (the compiled forest on the same 1)",
+  "batch_rows": 20000,
+  "date": "2026-10-31",
+  "python": "3.10.13",
+  "numpy": "2.2.6",
+  "xgboost": "3.2.0",
+  "lightgbm": "4.7.0",
+  "ydf": "0.16.1",
+  "libs": "xgboost,lightgbm,ydf,ydf-rf,sklearn-rf,xgboost-vector",
+  "runs": 3
+ },
+ "libraries": {
+  "old": "/bin-none/libtreeflat-x86_64.so",
+  "new": "/bin-inl/libtreeflat-x86_64.so"
+ },
+ "cells": {
+  "xgboost/flat/t1": {
+   "old_rows_per_s": [
+    28841,
+    28902,
+    28912
+   ],
+   "new_rows_per_s": [
+    29122,
+    29128,
+    29058
+   ],
+   "old_median": 28902,
+   "new_median": 29122,
+   "new_vs_old_pct": 0.8
+  },
+  "xgboost/wave/t1": {
+   "old_rows_per_s": [
+    28385,
+    28177,
+    28283
+   ],
+   "new_rows_per_s": [
+    28184,
+    28916,
+    28381
+   ],
+   "old_median": 28283,
+   "new_median": 28381,
+   "new_vs_old_pct": 0.3
+  },
+  "lightgbm/flat/t1": {
+   "old_rows_per_s": [
+    28432,
+    28385,
+    28345
+   ],
+   "new_rows_per_s": [
+    28526,
+    28437,
+    28466
+   ],
+   "old_median": 28385,
+   "new_median": 28466,
+   "new_vs_old_pct": 0.3
+  },
+  "ydf/flat/t1": {
+   "old_rows_per_s": [
+    98666,
+    98444,
+    98556
+   ],
+   "new_rows_per_s": [
+    98984,
+    98211,
+    98346
+   ],
+   "old_median": 98556,
+   "new_median": 98346,
+   "new_vs_old_pct": -0.2
+  },
+  "ydf-rf/flat/t1": {
+   "old_rows_per_s": [
+    82428,
+    82802,
+    82568
+   ],
+   "new_rows_per_s": [
+    82154,
+    81995,
+    80145
+   ],
+   "old_median": 82568,
+   "new_median": 81995,
+   "new_vs_old_pct": -0.7
+  },
+  "sklearn-rf/flat/t1": {
+   "old_rows_per_s": [
+    69650,
+    70718,
+    70240
+   ],
+   "new_rows_per_s": [
+    69884,
+    69983,
+    69684
+   ],
+   "old_median": 70240,
+   "new_median": 69884,
+   "new_vs_old_pct": -0.5
+  },
+  "xgboost-vector/flat/t1": {
+   "old_rows_per_s": [
+    28760,
+    28755,
+    28702
+   ],
+   "new_rows_per_s": [
+    28774,
+    28649,
+    28844
+   ],
+   "old_median": 28755,
+   "new_median": 28774,
+   "new_vs_old_pct": 0.1
+  },
+  "xgboost/flat/t2": {
+   "old_rows_per_s": [
+    43897,
+    44754,
+    44105
+   ],
+   "new_rows_per_s": [
+    44874,
+    45096,
+    43418
+   ],
+   "old_median": 44105,
+   "new_median": 44874,
+   "new_vs_old_pct": 1.7
+  },
+  "xgboost/wave/t2": {
+   "old_rows_per_s": [
+    42916,
+    44834,
+    43549
+   ],
+   "new_rows_per_s": [
+    43657,
+    44155,
+    44613
+   ],
+   "old_median": 43549,
+   "new_median": 44155,
+   "new_vs_old_pct": 1.4
+  },
+  "lightgbm/flat/t2": {
+   "old_rows_per_s": [
+    43621,
+    43244,
+    43251
+   ],
+   "new_rows_per_s": [
+    43890,
+    42955,
+    43562
+   ],
+   "old_median": 43251,
+   "new_median": 43562,
+   "new_vs_old_pct": 0.7
+  },
+  "ydf/flat/t2": {
+   "old_rows_per_s": [
+    151976,
+    152061,
+    151396
+   ],
+   "new_rows_per_s": [
+    150511,
+    150386,
+    154627
+   ],
+   "old_median": 151976,
+   "new_median": 150511,
+   "new_vs_old_pct": -1.0
+  },
+  "ydf-rf/flat/t2": {
+   "old_rows_per_s": [
+    126256,
+    123550,
+    126290
+   ],
+   "new_rows_per_s": [
+    123761,
+    117836,
+    129254
+   ],
+   "old_median": 126256,
+   "new_median": 123761,
+   "new_vs_old_pct": -2.0
+  },
+  "sklearn-rf/flat/t2": {
+   "old_rows_per_s": [
+    106336,
+    116683,
+    118529
+   ],
+   "new_rows_per_s": [
+    120139,
+    112546,
+    115305
+   ],
+   "old_median": 116683,
+   "new_median": 115305,
+   "new_vs_old_pct": -1.2
+  },
+  "xgboost-vector/flat/t2": {
+   "old_rows_per_s": [
+    44645,
+    43974,
+    42644
+   ],
+   "new_rows_per_s": [
+    43374,
+    44228,
+    44021
+   ],
+   "old_median": 43974,
+   "new_median": 44021,
+   "new_vs_old_pct": 0.1
+  }
+ }
+}

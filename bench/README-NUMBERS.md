@@ -3,7 +3,7 @@
 Everything below was measured on one machine in a slot reserved for the purpose, with nothing else running on purpose: an Intel Core i7-8550U CPU @ 1.80GHz
 (4 cores, 8 threads, AVX2, 1.80 GHz base), x86-64 Linux 6.8, Python 3.10.13, numpy 2.2.6, xgboost 3.2.0, lightgbm 4.7.0, ydf 0.16.1, on 2026-10-23.
 The prebuilt evaluator library is `bin/libtreeflat-x86_64.so`, SHA-256 `b0f290b1ab8ab312ce30110c07736e65aa435bee78eb0d89f2cac9ebbb87211e`; the
-generated code is built by the build defaults of this release (`opt-level` 3, the `fast` shape, the portable x86-64-v2 CPU, profile-guided
+generated code is built by QF 1.0's build (`--compile-preset 1.0`: `opt-level` 3, the `fast` shape, the portable x86-64-v2 CPU, profile-guided
 with the selection rows) on the machine that times it. The batch is 20,000 rows. The same scripts build the models on any machine
 (`--stage build`); the timing (`--stage measure`) needs a quiet one. Nothing measured on a shared machine is a figure here.
 
@@ -79,7 +79,7 @@ What these tables say:
   the library's own scaling decides the ratio: it is the number to measure on yours.
 
 - Why these figures are lower than the ones measured earlier on another machine (2026-10-22, a 2-core Intel Celeron N4020: 43.8x on 2 cores and 55.0x on one thread at 10 %): that was another machine. The build options are not the cause: in the paired test below the earlier build
-  defaults (`opt-level` 2, baseline x86-64) read 1.004 of the current ones on the same CPU. On one thread the Celeron timed xgboost on the full forest at 3,623 rows/s and
+  defaults (`opt-level` 2, baseline x86-64) read 1.004 of QF 1.0's build on the same CPU. On one thread the Celeron timed xgboost on the full forest at 3,623 rows/s and
   QuickForest at 199,137; this machine times them at 13,448 and 332,860: xgboost gained 3.7x from the faster CPU and QuickForest 1.7x, so the ratio is lower.
 
 Caveats, stated plainly:
@@ -92,30 +92,30 @@ Caveats, stated plainly:
 ### Build options on the 10 % forest, paired
 
 The same pruned 10 % forest (208,649 nodes) compiled with different build options and timed in ONE process, interleaved: each round times every
-build once (best of 3 passes over the same 20,000-row batch), in an order that rotates between rounds, for 30 rounds. Ratios are to the default
-build (`fast` shape, `opt-level` 3, portable x86-64-v2); the interval is a 95 % bootstrap interval of the median of the paired ratios.
-The "twin" is a byte copy of the default build timed as if it were another build: its ratio is the noise floor of the method.
+build once (best of 3 passes over the same 20,000-row batch), in an order that rotates between rounds, for 30 rounds. Ratios are to QF 1.0's
+build (`--compile-preset 1.0`: `fast` shape, `opt-level` 3, portable x86-64-v2); the interval is a 95 % bootstrap interval of the median of the paired ratios.
+The "twin" is a byte copy of QF 1.0's build timed as if it were another build: its ratio is the noise floor of the method.
 
-| build | 1 thread, ratio to default | all cores (8), ratio to default |
+| build | 1 thread, ratio to QF 1.0's build | all cores (8), ratio to QF 1.0's build |
 |---|---:|---:|
-| default (`fast` shape, opt 3, x86-64-v2) | 1 (315,240 rows/s) | 1 (1,254,915 rows/s) |
-| twin of the default (noise floor) | 0.996 (0.979 to 1.004) | 1.001 (0.999 to 1.004) |
-| `--shape top` (one codegen unit everywhere) | 1.003 (0.995 to 1.018) | 1.005 (1.000 to 1.009) |
+| QF 1.0's build (`--compile-preset 1.0`: `fast` shape, opt 3, x86-64-v2) | 1 (315,240 rows/s) | 1 (1,254,915 rows/s) |
+| twin of QF 1.0's build (noise floor) | 0.996 (0.979 to 1.004) | 1.001 (0.999 to 1.004) |
+| `--shape top` (one codegen unit everywhere; measured then, since removed) | 1.003 (0.995 to 1.018) | 1.005 (1.000 to 1.009) |
 | `--native` (this CPU only) | 0.932 (0.926 to 0.948) | 0.955 (0.948 to 0.959) |
 | earlier defaults (`opt-level` 2, baseline x86-64, one codegen unit per chunk) | 1.004 (0.978 to 1.018) | 1.000 (0.993 to 1.002) |
 
-On this forest and this CPU the medians of the `top` shape and of the earlier defaults are within 0.5 % of the default's, which is the size of the
+On this forest and this CPU the medians of the `top` shape and of the earlier defaults are within 0.5 % of QF 1.0's build, which is the size of the
 spread of the twin (0.4 %): the shape of the build, the optimisation level and the instruction-set level made no measurable difference here. `--native` ran 7 % slower on one thread and 4.5 % slower on all cores (ratio 0.955).
-The answers of every build are bit-identical to the default's on the 20,000 timed rows (checked). The one-thread pair was timed in the first window; the all-cores pair was timed again in the second window with the other processes' CPU logged (0.3 cores or less).
+The answers of every build are bit-identical to QF 1.0's build on the 20,000 timed rows (checked). The one-thread pair was timed in the first window; the all-cores pair was timed again in the second window with the other processes' CPU logged (0.3 cores or less).
 
 To repeat the paired test: build the same pruned model once per set of build options with `scripts/compare.py` (same `PRUNED_DIR` and `DATA.npz`,
 `--stage build`, a different `--work` folder each time, and the options `--opt shape=top`, `--opt target_cpu=native`,
-`--opt opt_level=2 --opt target_cpu=x86-64 --opt shape=top` (the earlier defaults), or none for the default), then time the builds together and print the ratios:
+`--opt opt_level=2 --opt target_cpu=x86-64 --opt shape=top` (the earlier defaults), or none), each with `--opt compile_preset=1.0` (QF 1.0's build; `bench/common.compare` passes it by default, and `compare.py` alone would build the library's own default, the 1.1 preset), then time the builds together and print the ratios:
 
 ```
 mkdir -p WORK/default WORK/top      # compare.py checks the folder of --json before it makes --work
-python3 -s scripts/compare.py PRUNED_DIR --data DATA.npz --backends flat,codegen-pgo --decision argmax --threads 1 --stage build --work WORK/default/cmp --json WORK/default/table.json
-python3 -s scripts/compare.py PRUNED_DIR --data DATA.npz --backends flat,codegen-pgo --decision argmax --threads 1 --stage build --work WORK/top/cmp --json WORK/top/table.json --opt shape=top
+python3 -s scripts/compare.py PRUNED_DIR --data DATA.npz --backends flat,codegen-pgo --decision argmax --threads 1 --stage build --work WORK/default/cmp --json WORK/default/table.json --opt compile_preset=1.0
+python3 -s scripts/compare.py PRUNED_DIR --data DATA.npz --backends flat,codegen-pgo --decision argmax --threads 1 --stage build --work WORK/top/cmp --json WORK/top/table.json --opt compile_preset=1.0 --opt shape=top
 taskset -c 1 python3 -s bench/pair.py --threads 1 --rounds 30 --twin default --out pair-t1.json default=WORK/default/cmp top=WORK/top/cmp   # one thread, pinned
 python3 -s bench/pair.py --threads 8 --rounds 30 --twin default --out pair-t8.json default=WORK/default/cmp top=WORK/top/cmp                # every logical CPU of an 8-thread machine
 python3 -s bench/pair_stats.py default pair-t1.json pair-t8.json      # median ratio, 95 % bootstrap interval, mean with its t interval
@@ -181,7 +181,7 @@ refused runs; `--min-agreement 0` lets a dense build go on to compile.)
 One model per library, 42 features, trained on the dense generator at noise 0.35 (no pruning, so there is no agreement figure; the compiled
 forest is bit-compared with the flat walker and the max error against the library is shown). Rows/s, 20,000-row batch; the speedup is the
 compiled rows/s over the library's rows/s on the same number of threads. Median of three runs. The library and the compiled forest are
-timed in separate processes, one after the other. `codegen-block` is the generated code built by this release's defaults (`fast` shape, opt 3,
+timed in separate processes, one after the other. `codegen-block` is the generated code built by QF 1.0's build (`--compile-preset 1.0`: `fast` shape, opt 3,
 x86-64-v2); the wave engines are the prebuilt library's. This CPU's Downfall (GDS) microcode makes gathers slow, so `wave-avx2` ran the scalar wave engine here (`engine_used` 1 in the run's JSON): the two wave columns are the same engine, and the gap between them is run-to-run noise.
 
 ### All cores (8) against all cores (8)

@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib.util
+import itertools
 import json
 import math
 import os
@@ -22,12 +23,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from evaluator import segment_decisions
 
 # The numbers the flat file's header and the generated crate's metadata give the output transform and the fold averaging.
 OBJECTIVE = {"identity": 0, "sigmoid": 1, "softmax": 2, "exp": 3}
 AVERAGE = {"output": 0, "margin": 1}
 # Everything `Forest.requires` can list: what a backend that holds every forest declares as its `supports`.
-FEATURES = frozenset({"sum64", "objective:exp", "objective:identity-with-several-groups", "zero_missing", "categorical", "linear_leaves"})
+FEATURES = frozenset(
+    {"sum64", "objective:exp", "objective:identity-with-several-groups", "zero_missing", "categorical", "linear_leaves", "vector_leaves"}
+)
+# `Tree.group` of a vector tree (one leaf adds a whole row to every output group); the flat file writes it as 0xFFFF_FFFF. NEVER index with
+# it: numpy takes -1 as the last group and writes there silently, so every consumer of a group tests `vector` / `Spec.vector_width` first.
+VECTOR_GROUP = -1
 
 KINDS = {"multi:softprob": "softmax", "binary:logistic": "sigmoid", "reg:logistic": "sigmoid", "reg:squarederror": "identity"}
 
@@ -190,10 +197,17 @@ class Spec:
     rf: bool = field(init=False)
     task: str = "auto"  # classification | regression; auto = regression for identity outputs (xgboost's only case)
     mean_type: bool | None = None  # trees are averaged by the format itself (LightGBM average_output, YDF random forest)
+    # W >= 2 when every tree of the model is a vector tree (== groups), else 0. Then `tree_info` carries no group: a consumer branches on this
+    # BEFORE it reads tree_info (pruning keeps whole vector trees; a tree_info value of -1 would index the last group).
+    vector_width: int = 0
 
     def __post_init__(self):
         if self.n_features < 1:  # xgboost loads (does not train) a model that says so; nothing could be asked of it
             raise ValueError("the model has no input features (num_feature is 0): there is nothing to compile")
+        if self.vector_width not in (0, self.groups) or self.vector_width == 1:
+            raise ValueError(
+                f"vector_width must be 0 or the number of groups (at least 2), not {self.vector_width} with {self.groups} groups"
+            )
         self.rf = self.parallel > 1 if self.mean_type is None else self.mean_type
         if self.task == "auto":
             self.task = "regression" if self.kind == "identity" else "classification"
@@ -270,6 +284,12 @@ def reachable_nodes(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     return seen
 
 
+def leaf_ordinal(left: np.ndarray) -> np.ndarray:
+    """Per node, its leaf's ordinal among the leaves of its tree in node order (the row of the tree's leaf-vector table); meaningless at an
+    inner node. The ONE rule the readers' `leaf_codes` and the structure export share."""
+    return np.cumsum(np.asarray(left) == -1) - 1
+
+
 def model_header(raw: dict):
     """What an xgboost model document says apart from its trees: (objective, kind, groups, learner_model_param, model)."""
     lrn = raw["learner"]
@@ -286,18 +306,37 @@ def model_header(raw: dict):
         raise ValueError(DART_REFUSAL)
     param = lrn["learner_model_param"]
     kind = KINDS[objective]
-    groups = int(param["num_class"]) if kind == "softmax" else 1
+    num_target, num_class = int(param.get("num_target", "1")), int(param.get("num_class", "0"))
+    if num_target >= 2 and num_class >= 2:
+        raise ValueError(f"num_target {num_target} together with num_class {num_class} is not supported (xgboost has no such model)")
+    groups = num_class if kind == "softmax" else num_target
     if kind == "softmax" and groups < 2:  # the softmax of one logit is a constant 1.0; the compiled file would be one the loader refuses
         raise ValueError(f"{objective} with num_class={groups} has a single class: nothing to classify (train with at least 2 classes)")
     return objective, kind, groups, param, gb["model"]
 
 
-def make_spec(header, n_trees: int, nodes, off, vals) -> Spec:
+MULTILABEL_REFUSAL = (
+    "{objective} with {groups} targets and multi_strategy=one_output_per_tree is not supported: "
+    "multilabel needs multi_strategy=multi_output_tree"
+)
+
+
+def make_spec(header, n_trees: int, nodes, off, vals, vector_width: int = 0) -> Spec:
     """The Spec of a model from its header and what was read of its trees (`nodes`: reachable nodes per tree, `off`: first entry of each
-    tree in `vals`, `vals`: the split_conditions of every entry)."""
+    tree in `vals`, `vals`: the split_conditions of every entry, `vector_width`: W of the vector leaves, 0 for scalar trees)."""
     objective, kind, groups, param, model = header
+    if vector_width not in (0, groups):
+        raise ValueError(f"the trees hold {vector_width} values per leaf, the model has {groups} outputs")
+    if (
+        not vector_width and groups > n_trees
+    ):  # every output of a one-tree-per-output model has a tree; a damaged header must not size arrays
+        raise ValueError(f"the header declares {groups} outputs but the model holds {n_trees} trees: every output needs at least one tree")
     if len(model["tree_info"]) != n_trees:
         raise ValueError(f"tree_info holds {len(model['tree_info'])} entries for {n_trees} trees")
+    if kind == "sigmoid" and groups > 1 and not vector_width:
+        # xgboost multilabel (one sigmoid per target) with one tree per target: no compiled form answers it (the flat file refuses a sigmoid over
+        # several groups unless the trees are vector trees)
+        raise ValueError(MULTILABEL_REFUSAL.format(objective=objective, groups=groups))
     info = np.asarray(model["tree_info"], dtype=np.int64)
     if len(info) and (info.min() < 0 or info.max() >= groups):
         raise ValueError("tree_info names an output group the model does not have")
@@ -311,6 +350,7 @@ def make_spec(header, n_trees: int, nodes, off, vals) -> Spec:
         off=off,
         vals=vals,
         parallel=int(model["gbtree_model_param"].get("num_parallel_tree", "1")),
+        vector_width=vector_width,
     )
 
 
@@ -319,17 +359,53 @@ def spec_from_header(raw: dict, nodes, off, n_trees: int) -> Spec:
     return make_spec(model_header(raw), n_trees, nodes, off, np.zeros(0, np.float32))
 
 
+def leaf_vector_width(t: dict) -> int:
+    return int(t["tree_param"].get("size_leaf_vector", "1"))
+
+
+def vector_leaf_view(t: dict, w: int, i: int) -> dict:
+    """A tree of vector leaves (`multi_strategy=multi_output_tree`) as the plain tree arrays the other checks expect, plus `leaf_vector`:
+    the float32 (nodes, w) table, the leaf's row at a leaf and 0 elsewhere. xgboost keeps the vectors in `leaf_weights`, and `right_children`
+    holds the LEAF INDEX at a leaf (not -1): node n's vector is `leaf_weights[right[n] * w:(right[n] + 1) * w]`. `base_weights` repeats every
+    node's vector, so a model whose two stores disagree (or whose stride is not w: the reduced-gradient mode) is refused, not guessed."""
+    left, right = np.asarray(t["left_children"], np.int64), np.asarray(t["right_children"], np.int64)
+    n, leaf = len(left), left == -1
+    n_leaves = int(leaf.sum())
+    weights, base = t.get("leaf_weights"), t.get("base_weights")
+    if weights is None or base is None or len(right) != n:
+        raise ValueError(f"tree {i}: a vector-leaf tree without leaf_weights or base_weights")
+    if len(base) != n * w:
+        raise ValueError(f"tree {i}: xgboost reduced-gradient multi-output trees are not supported (base_weights holds {len(base)} values)")
+    if len(weights) != n_leaves * w:
+        raise ValueError(f"tree {i}: leaf_weights holds {len(weights)} values for {n_leaves} leaves of {w}")
+    index = right[leaf]
+    if n_leaves and (index.min() < 0 or index.max() >= n_leaves or len(np.unique(index)) != n_leaves):
+        raise ValueError(f"tree {i}: a leaf index is outside the leaf_weights or used twice")
+    table = np.zeros((n, w), np.float32)
+    table[leaf] = np.asarray(weights, np.float32).reshape(n_leaves, w)[index]
+    if not np.isfinite(table).all():
+        raise ValueError(f"tree {i}: leaf_weights holds a value that is not a finite number")
+    if not np.array_equal(np.asarray(base, np.float32).reshape(n, w)[leaf], table[leaf]):
+        raise ValueError(f"tree {i}: base_weights does not match leaf_weights at the leaves")
+    return {**t, "right_children": np.where(leaf, -1, right), "leaf_vector": table}
+
+
 def parse_model(raw: dict) -> tuple[Spec, list[dict]]:
+    """The Spec and the trees. A vector-leaf tree comes back as `vector_leaf_view` shows it (its `right_children` is -1 at a leaf)."""
     header = model_header(raw)
     param, model = header[3], header[4]
     trees = model["trees"]
     if not trees:
         raise ValueError("the model has no trees (trained for zero rounds?)")
+    widths = {leaf_vector_width(t) for t in trees}
+    if len(widths) > 1:
+        raise ValueError(f"the trees hold different numbers of values per leaf ({sorted(widths)})")
+    width = widths.pop() if widths != {1} else 0
     for t in trees:
         if any(s != 0 for s in t["split_type"]) or t["categories"]:
             raise ValueError("categorical splits are not supported")
-        if int(t["tree_param"].get("size_leaf_vector", "1")) > 1:
-            raise ValueError("vector leaves are not supported")
+    if width:
+        trees = [vector_leaf_view(t, width, i) for i, t in enumerate(trees)]
     for i, t in enumerate(trees):
         check_xgb_tree(t, int(param["num_feature"]), i)
     sizes = np.array([len(t["left_children"]) for t in trees], dtype=np.int64)
@@ -339,7 +415,7 @@ def parse_model(raw: dict) -> tuple[Spec, list[dict]]:
         [int(reachable_nodes(np.asarray(t["left_children"]), np.asarray(t["right_children"])).sum()) for t in trees], dtype=np.int64
     )
     vals = np.concatenate([np.asarray(t["split_conditions"], dtype=np.float32) for t in trees])
-    return make_spec(header, len(trees), nodes, off, vals), trees
+    return make_spec(header, len(trees), nodes, off, vals, width), trees
 
 
 def transform(m: np.ndarray, kind: str) -> np.ndarray:
@@ -421,19 +497,81 @@ def count_arg(minimum: int):
 
 
 # ---------------------------------------------------------------------------------------------------- decisions
-def make_rule(text: str, groups: int, kind: str, p_full: np.ndarray | None = None, tol: float | None = None, task: str = "auto"):
+def decision_segments(groups: int, kind: str, vector_width: int, segments) -> list[int] | None:
+    """The output segments a decision rule works on, or None when the model has ONE output (every 1.1 case). A classifier with several
+    outputs (sklearn) brings its own `segments`; a vector forest with a sigmoid over several groups (xgboost multilabel) decides every
+    column on its own, i.e. segments of width 1."""
+    if segments is not None and len(segments) > 2:
+        return [int(v) for v in segments]
+    if vector_width and kind == "sigmoid" and groups > 1:
+        return list(range(groups + 1))
+    return None
+
+
+def truth_outputs(groups: int, kind: str, task: str, vector_width: int, segments) -> int:
+    """The number of columns the truth `y` has for a model: one per output of a multi-output model (a K-target regression, a classifier
+    with several outputs, a multilabel vector forest), one otherwise (a class label, a single target)."""
+    segs = decision_segments(groups, kind, vector_width, segments)
+    return (len(segs) - 1) if segs else (groups if task == "regression" else 1)
+
+
+def forest_truth_outputs(forest) -> int:
+    """`truth_outputs` for a loaded Forest (a vector forest is one whose trees carry the VECTOR_GROUP mark)."""
+    vec = any(t.vector is not None for m in forest.models for t in m.trees)  # as `forest_segments`: one test for "a vector forest"
+    return truth_outputs(forest.groups, forest.kind, forest.task, forest.groups if vec else 0, forest.segments)
+
+
+def require_truth_columns(y, n_out: int, what) -> None:
+    """A truth `y` with a number of columns the model does not have is refused: (rows,) and (rows, 1) mean one column. `load_data` lets a
+    (rows, K) `y` through because only the model knows the width it needs."""
+    if y is None:
+        return
+    cols = 1 if np.ndim(y) == 1 else np.shape(y)[1]
+    if cols != n_out:
+        raise ValueError(f"{what}: y has {cols} column(s) for a model of {n_out} output(s); give y of shape (rows, {n_out})")
+
+
+def make_rule(
+    text: str,
+    groups: int,
+    kind: str,
+    p_full: np.ndarray | None = None,
+    tol: float | None = None,
+    task: str = "auto",
+    segments=None,
+):
     """A decision rule: outputs (..., G) -> integer decisions (...). `argmax` (0.5 for one output), `threshold:T` (one output),
-    `path/to/rule.py[:func]` (func(p) -> ints, p of shape (..., G): the outputs are the LAST axis, the leading axes are rows or candidates x rows), and for regression `tol` bins of width tol."""
+    `path/to/rule.py[:func]` (func(p) -> ints, p of shape (..., G): the outputs are the LAST axis, the leading axes are rows or candidates x rows), and for regression `tol` bins of width tol.
+    With `segments` (a model of K > 1 outputs, see `decision_segments`) the decisions are (..., K): one integer per output, and a rule file
+    must return that shape; a regression model of K > 1 outputs bins every column on its own width."""
+    segments = segments if segments is not None and len(segments) > 2 else None
     if (kind == "identity" and task == "auto") or task == "regression":
+        if groups > 1:  # K outputs: every column is binned on its own, so the outputs in other units weigh the same
+            if tol:
+                width = tol
+            else:
+                sd = np.std(p_full, axis=0) if p_full is not None else np.ones(groups)
+                width = np.where(sd > 0, 0.1 * sd, 1.0)
+            return lambda p: np.rint(p / width).astype(np.int64)
         width = tol or float(0.1 * np.std(p_full)) or 1.0
         return lambda p: np.rint(p[..., 0] / width).astype(np.int64)
     if text == "argmax":
+        if segments is not None:
+            return lambda p: segment_decisions(p, segments)
         if groups == 1:
             return lambda p: (p[..., 0] >= 0.5).astype(np.int64)
         return lambda p: p.argmax(-1)
     if text.startswith("threshold:"):
+        if segments is not None:
+            raise ValueError(
+                f"--decision threshold:T needs a single output; this model has {len(segments) - 1} outputs "
+                "(use argmax, or a rule file for another rule)"
+            )
         if groups != 1:
-            raise ValueError("--decision threshold:T needs a single output; use a rule file for several classes")
+            raise ValueError(
+                f"--decision threshold:T needs one probability column; this model's output has {groups} class columns "
+                "(use argmax, or a rule file for another rule)"
+            )
         try:
             t = float(text.split(":", 1)[1])
         except ValueError:
@@ -455,25 +593,33 @@ def make_rule(text: str, groups: int, kind: str, p_full: np.ndarray | None = Non
         raise ValueError(f"--decision {text!r}: loading {path} failed ({type(e).__name__}: {e})") from e
     if not callable(getattr(mod, name or "decide", None)):
         raise ValueError(f"--decision {text!r}: {path} has no function {name or 'decide'}")
-    return checked_rule(getattr(mod, name or "decide"), groups, f"--decision {text!r}")
+    return checked_rule(getattr(mod, name or "decide"), groups, f"--decision {text!r}", segments)
 
 
-def checked_rule(fn, groups: int, label: str):
+def checked_rule(fn, groups: int, label: str, segments=None):
     """The user's rule file as a rule the tools can trust: every call is checked (an exception, a result of the wrong shape or one that
     is not made of integers becomes one ValueError line), and it is tried once here, on a small (candidates, rows, groups) array and on a
     (rows, groups) one, because the greedy selection calls it with the first and check/prune's held-out figures with the second. A rule
-    that marks an abstention with NaN is refused: NaN == NaN is False, so every row both forests abstain on would count as a disagreement."""
+    that marks an abstention with NaN is refused: NaN == NaN is False, so every row both forests abstain on would count as a disagreement.
+    A model of K > 1 outputs (`segments`) needs one integer per output: shape (..., K)."""
+    outputs = (len(segments) - 1,) if segments is not None and len(segments) > 2 else ()
 
     def rule(p):
+        # the rule gets a read-only view: the same `p` is judged again by the tools (the full forest's answer is reused for every candidate), and
+        # a rule that writes into it (`p[p < 0.5] = 0`) would silently change every figure after it
+        view = np.asarray(p).view()
+        view.flags.writeable = False
         try:
-            out = np.asarray(fn(p))
+            out = np.asarray(fn(view))
         except Exception as e:  # the user's own code
-            raise ValueError(f"{label}: the rule failed on an array of shape {p.shape} ({type(e).__name__}: {one_line(e)})") from None
-        want = p.shape[:-1]
+            hint = "; the rule must not modify p, work on a copy" if "read-only" in str(e) else ""
+            raise ValueError(f"{label}: the rule failed on an array of shape {p.shape} ({type(e).__name__}: {one_line(e)}){hint}") from None
+        want = p.shape[:-1] + outputs
         if out.shape != want:
+            what = f"one integer per row and output, shape {want}" if outputs else f"one integer per row, shape {want}"
             raise ValueError(
-                f"{label}: the rule returned shape {out.shape} for an input of shape {p.shape}; it must return one integer per row, shape "
-                f"{want} (the last axis of the input holds the {groups} outputs: write p[..., 0] and p.argmax(-1), not p[:, 0])"
+                f"{label}: the rule returned shape {out.shape} for an input of shape {p.shape}; it must return {what} "
+                f"(the last axis of the input holds the {groups} outputs: write p[..., 0] and p.argmax(-1), not p[:, 0])"
             )
         if out.dtype.kind in "biu":
             return out.astype(np.int64, copy=False)
@@ -512,34 +658,73 @@ class RegBar:
     def describe(self) -> dict:
         return {"space": self.space, "median_pct": self.median_pct, "max_pct": self.max_pct, "error_slack": self.error_slack}
 
-    def rel_diff(self, p_full: np.ndarray, p_pruned: np.ndarray) -> np.ndarray:
-        a, b = p_full.reshape(len(p_full), -1)[:, 0].astype(np.float64), p_pruned.reshape(len(p_pruned), -1)[:, 0].astype(np.float64)
+    def _rel(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """|pruned - full| relative, for float64 vectors a (full) and b (pruned) of ONE output."""
         if self.space == "log":
             return np.abs(np.expm1(b - a))
         return np.abs(b - a) / np.maximum(np.abs(a), 1e-12)
 
-    def check(self, p_full, p_pruned, y=None) -> dict:
-        """The verdict is taken on the exact figures; the rounded ones in the result are for the report only."""
-        r = 100 * self.rel_diff(p_full, p_pruned)
-        out = {"rows": len(r), "bars": self.describe()}
+    def rel_diff(self, p_full: np.ndarray, p_pruned: np.ndarray) -> np.ndarray:
+        """(rows,) for a model of one output, (rows, K) for K outputs: every column on its own."""
+        a, b = p_full.reshape(len(p_full), -1).astype(np.float64), p_pruned.reshape(len(p_pruned), -1).astype(np.float64)
+        if a.shape[1] == 1:
+            return self._rel(a[:, 0], b[:, 0])
+        return np.stack([self._rel(a[:, j], b[:, j]) for j in range(a.shape[1])], 1)
+
+    def _column(self, a: np.ndarray, b: np.ndarray, y: np.ndarray | None, tag: str) -> dict:
+        """The figures and failures of ONE output (a = full, b = pruned answers, float64; y its truth or None). `tag` starts every failure line."""
+        r = 100 * self._rel(a, b)
+        out = {}
         exact = dict(zip(("median", "p90", "p99", "max"), np.percentile(r, [50, 90, 99, 100]), strict=True))
         out.update({f"{n}_pct": round(float(v), 4) for n, v in exact.items()})
         out["over_max"] = int((~(r <= self.max_pct)).sum())
         fails = []
         # every comparison is written so that a NaN (a model that answers NaN) fails the bar instead of passing it
         if not exact["median"] <= self.median_pct:
-            fails.append(f"median |pruned - full| {float(exact['median']):.6g} % > bar {self.median_pct} %")
+            fails.append(f"{tag}median |pruned - full| {float(exact['median']):.6g} % > bar {self.median_pct} %")
         if not exact["max"] <= self.max_pct:
-            fails.append(f"{out['over_max']} rows differ by more than {self.max_pct} % (max {float(exact['max']):.6g} %)")
+            fails.append(f"{tag}{out['over_max']} rows differ by more than {self.max_pct} % (max {float(exact['max']):.6g} %)")
         if y is not None:
-            e_full = float(np.abs(p_full.reshape(len(y), -1)[:, 0] - y).mean())
-            e_pruned = float(np.abs(p_pruned.reshape(len(y), -1)[:, 0] - y).mean())
-            out.update(mae_full=round(e_full, 6), mae_pruned=round(e_pruned, 6), error_checked=True)
+            e_full, e_pruned = float(np.abs(a - y).mean()), float(np.abs(b - y).mean())
+            out.update(mae_full=round(e_full, 6), mae_pruned=round(e_pruned, 6))
             if not e_pruned <= e_full * (1 + self.error_slack):
-                fails.append(f"held-out MAE pruned {e_pruned:.5f} > full {e_full:.5f} x {1 + self.error_slack:g}")
-        else:
-            out["error_checked"] = False
+                fails.append(f"{tag}held-out MAE pruned {e_pruned:.5f} > full {e_full:.5f} x {1 + self.error_slack:g}")
         out["failures"], out["ok"] = fails, not fails
+        return out
+
+    def check(self, p_full, p_pruned, y=None) -> dict:
+        """The verdict is taken on the exact figures; the rounded ones in the result are for the report only. A model of K > 1 outputs is
+        judged output by output (`y` then has K columns): `per_output` holds one dict each, every figure at the top level is the WORST
+        output's, `failures` name the output and `ok` needs all of them."""
+        a = np.asarray(p_full).reshape(len(p_full), -1).astype(np.float64)
+        b = np.asarray(p_pruned).reshape(len(p_pruned), -1).astype(np.float64)
+        k = a.shape[1]
+        y2 = None
+        if y is not None:
+            y2 = np.asarray(y, np.float64)
+            y2 = y2.reshape(len(y2), -1)
+            if len(y2) != len(a) or y2.shape[1] != k:
+                raise UsageError(f"y has {y2.shape[1]} column(s) for {len(y2)} rows, but the model has {k} output(s) on {len(a)} rows")
+        out = {"rows": len(a), "bars": self.describe()}
+        if k == 1:
+            col = self._column(a[:, 0], b[:, 0], None if y2 is None else y2[:, 0], "")
+            out.update({n: v for n, v in col.items() if n not in ("failures", "ok")})
+            out["error_checked"] = y is not None
+            out["failures"], out["ok"] = col["failures"], col["ok"]
+            return out
+        cols = [self._column(a[:, j], b[:, j], None if y2 is None else y2[:, j], f"output {j}: ") for j in range(k)]
+        for key in ("median_pct", "p90_pct", "p99_pct", "max_pct"):
+            out[key] = float(np.max([c[key] for c in cols]))
+        out["over_max"] = max(c["over_max"] for c in cols)
+        # each figure above is the worst output's (a NaN counts as the worst); the MAE pair is that of the output whose MAE misses its bar by most
+        if y2 is not None:
+            excess = [c["mae_pruned"] - c["mae_full"] * (1 + self.error_slack) for c in cols]
+            bad = int(np.argmax(excess))
+            out.update(mae_full=cols[bad]["mae_full"], mae_pruned=cols[bad]["mae_pruned"])
+        out["error_checked"] = y is not None
+        out["per_output"] = [{"output": j, **c} for j, c in enumerate(cols)]
+        out["failures"] = [m for c in cols for m in c["failures"]]
+        out["ok"] = all(c["ok"] for c in cols)
         return out
 
 
@@ -651,8 +836,10 @@ def _load_data(path) -> dict[str, np.ndarray]:
             a = data[name]
             if a.ndim == 2 and a.shape[1] == 1:
                 a = a.reshape(-1)  # the one unambiguous reading of a column
-            if a.shape != (n,):
-                raise ValueError(f"{p}: {name} must hold one value per row of X, shape ({n},) or ({n}, 1); got shape {a.shape}")
+            if name == "y" and a.ndim == 2 and a.shape[0] == n:
+                pass  # (rows, K): one truth column per output of a multi-output model; the width is checked against the model (prune)
+            elif a.shape != (n,):
+                raise ValueError(f"{p}: {name} must hold one value per row of X, shape ({n},), ({n}, 1) or ({n}, K); got shape {a.shape}")
             require_numbers(a, name, p)
             if name in WHOLE_NUMBER_ARRAYS:
                 require_whole_numbers(a, name, p)
@@ -767,6 +954,12 @@ class Tree:
     # (LightGBM's text model holds doubles; a YDF random forest divides by the number of trees). `value` stays the float32 copy that the
     # default compile uses; the opt-in f64 leaves (`compile --f64-leaves`) store and generate these instead. None when `value` is exact.
     leaf64: np.ndarray | None = None
+    # VECTOR TREES (`group == VECTOR_GROUP`): float32 (n_nodes, W), the row a leaf adds to groups 0..W-1 (zeros at internal nodes), W ==
+    # `Forest.groups` >= 2; `value` is 0 at its leaves, `linear` and `leaf64` are None. `vector64` is the same table in double for the
+    # sources whose leaves are not float32 numbers (sklearn fractions, YDF random-forest shares); stored only by `compile --f64-leaves`.
+    # Readers never emit W = 1: a one-output model is scalar trees. `check_vector` holds the whole contract.
+    vector: np.ndarray | None = None
+    vector64: np.ndarray | None = None
 
 
 @dataclass
@@ -796,6 +989,8 @@ class Forest:
     late_margin: bool = False
     # the factor a base margin is multiplied by: the models' common `sigmoid:s` (NaN: the models disagree, a margin is refused)
     margin_scale: float = 1.0
+    # class offsets of each output `[0, c_1, c_1 + c_2, ..., groups]` for a classifier with several outputs (sklearn); None = one block
+    segments: list[int] | None = None
 
     @property
     def n_trees(self) -> int:
@@ -818,6 +1013,8 @@ class Forest:
             need.add("objective:identity-with-several-groups")  # YDF random forest classification: the outputs are already probabilities
         for m in self.models:
             for t in m.trees:
+                if t.vector is not None:
+                    need.add("vector_leaves")
                 if t.zero_missing is not None and t.zero_missing.any():
                     need.add("zero_missing")
                 if t.cat:
@@ -825,6 +1022,50 @@ class Forest:
                 if t.linear:
                     need.add("linear_leaves")
         return need
+
+
+def check_vector(forest: Forest) -> None:
+    """Refuses, in one line, a forest that breaks the vector-tree contract (see `Tree.vector`): every backend and every consumer of `group`
+    calls it first. A forest with no vector tree passes when its scalar trees name a group it has and `segments` is None."""
+    vector = [t.vector is not None for m in forest.models for t in m.trees]
+    if any(vector) and not all(vector):
+        raise ValueError("the forest mixes vector trees and scalar trees")
+    if any(vector):
+        if forest.groups < 2:
+            raise ValueError(f"vector trees need at least 2 output groups, the forest has {forest.groups}")
+        if any(m.margin_scale != 1.0 for m in forest.models) or forest.margin_scale != 1.0:
+            raise ValueError("vector trees do not take a margin scale (LightGBM `sigmoid:s`)")
+    for i, t in enumerate(t for m in forest.models for t in m.trees):
+        if t.vector is None:
+            if t.vector64 is not None or not 0 <= t.group < forest.groups:
+                raise ValueError(f"tree {i}: group {t.group} is not an output group of the {forest.groups} the forest has")
+            continue
+        _check_vector_tree(t, i, forest.groups)
+    if forest.segments is not None:
+        seg = forest.segments
+        if not any(vector):
+            raise ValueError("output segments belong to vector trees, and the forest has none")
+        if len(seg) < 2 or seg[0] != 0 or seg[-1] != forest.groups or any(a >= b for a, b in itertools.pairwise(seg)):
+            raise ValueError(f"output segments {list(seg)} must rise strictly from 0 to the {forest.groups} groups")
+
+
+def _check_vector_tree(t: Tree, i: int, groups: int) -> None:
+    n = len(t.left)
+    if t.group != VECTOR_GROUP:
+        raise ValueError(f"tree {i}: a vector tree has group {VECTOR_GROUP}, not {t.group}")
+    if t.linear or t.leaf64 is not None:
+        raise ValueError(f"tree {i}: a vector tree holds no linear leaves and no leaf64 (use vector64)")
+    for name, table, dtype in (("vector", t.vector, np.float32), ("vector64", t.vector64, np.float64)):
+        if table is None:
+            continue
+        if table.dtype != dtype or table.shape != (n, groups):
+            raise ValueError(f"tree {i}: {name} must be {np.dtype(dtype).name} of shape ({n}, {groups}), not {table.dtype} {table.shape}")
+        if not np.isfinite(table).all():
+            raise ValueError(f"tree {i}: {name} holds a value that is not a finite number")
+        if table[t.left != -1].any():
+            raise ValueError(f"tree {i}: {name} must be zero at the internal nodes")
+    if t.value[t.left == -1].any():
+        raise ValueError(f"tree {i}: the leaf values of a vector tree must be 0 (the row is in `vector`)")
 
 
 COUNT_OPTIONS = {"block": (1, 4096), "chunk_nodes": (1, 10**9), "jobs": (1, 256), "opt_level": (0, 3), "codegen_units": (1, 256)}
@@ -893,19 +1134,20 @@ def load_forest(files: list[Path], average: str = "output", float32_sums: bool =
     xgboost uses) reproduces `model.predict` bit for bit, where the default double sums differ from it by that noise."""
     import qf_formats
 
-    models, head, task, sum64, fmts, first_names = [], None, "auto", False, set(), None
+    models, head, task, sum64, fmts, first_names, segments = [], None, "auto", False, set(), None, None
     for f in files:
         src = qf_formats.open_source(f)
         fmts.add(src.fmt)
         sum64 |= not isinstance(src, qf_formats.XgbSource)
-        key = (src.spec.n_features, src.spec.groups, src.spec.kind)
+        seg = getattr(src, "forest_segments", lambda: None)()
+        key = (src.spec.n_features, src.spec.groups, src.spec.kind, seg, src.spec.task)
         if head not in (None, key):
-            raise ValueError("the models disagree on features, classes or objective")
+            raise ValueError("the models disagree on features, outputs, classes or objective")
         names = getattr(src, "names", None)  # YDF reads matrix column i as its i-th input feature BY NAME: folds must agree on the order
         if names is not None and first_names not in (None, names):
             raise ValueError(f"{f.name}: the models disagree on the names or the order of the input features ({first_names} and {names})")
         first_names = names if first_names is None else first_names
-        head, task = key, src.spec.task
+        head, task, segments = key, src.spec.task, seg
         with qf_formats.malformed(f, src.fmt):
             models.append(src.model_ir(True) if float32_sums and src.fmt == "ydf" else src.model_ir())
     if float32_sums:
@@ -917,13 +1159,30 @@ def load_forest(files: list[Path], average: str = "output", float32_sums: bool =
         sum64 = False
     scales = {m.margin_scale for m in models}
     scale = scales.pop() if len(scales) == 1 else float("nan")
-    return Forest(head[0], head[1], head[2], average, models, task, sum64, late_margin=float32_sums, margin_scale=scale)
+    forest = Forest(
+        head[0], head[1], head[2], average, models, task, sum64, late_margin=float32_sums, margin_scale=scale, segments=segments
+    )
+    check_vector(forest)
+    return forest
+
+
+def forest_segments(forest: Forest) -> list[int] | None:
+    """`decision_segments` of a Forest (None for every one-output forest)."""
+    vector = any(t.vector is not None for m in forest.models for t in m.trees)
+    return decision_segments(forest.groups, forest.kind, forest.groups if vector else 0, forest.segments)
+
+
+def forest_rule(decision: str, forest: Forest):
+    """The decision rule of a classification forest, built with the forest's own segments (every tool that judges decisions asks for it here,
+    so none can forget them); None for a regression forest, which has no class decisions."""
+    if forest.task != "classification":
+        return None
+    return make_rule(decision, forest.groups, forest.kind, None, None, forest.task, forest_segments(forest))
 
 
 def require_rule(decision: str, forest: Forest) -> None:
     """Builds the decision rule of a classification forest only to refuse one that cannot be used, before any long work is done."""
-    if forest.task == "classification":
-        make_rule(decision, forest.groups, forest.kind, None, None, forest.task)
+    forest_rule(decision, forest)
 
 
 def reference_predict(files: list[Path], x: np.ndarray, average: str = "output", base_margin: np.ndarray | None = None) -> np.ndarray:
@@ -981,7 +1240,10 @@ def leaf_positions(t: Tree, x: np.ndarray) -> np.ndarray:
 
 
 def tree_values(t: Tree, x: np.ndarray) -> np.ndarray:
+    """Per row, what the tree adds: a (rows,) vector of leaf values, or (rows, W) float32 for a vector tree."""
     pos = leaf_positions(t, x)
+    if t.vector is not None:
+        return t.vector[pos]
     out = t.value[pos]
     if not t.linear:
         return out
@@ -1001,6 +1263,7 @@ def ir_predict(forest: Forest, x: np.ndarray, average: str | None = None, base_m
     """A slow numpy evaluator of the forest's own semantics, extensions included (float64 sums). It is the reference for the
     adapters' tests and the semantics a backend must implement: (rows, groups) outputs. `base_margin` (rows, groups) is added to
     every model's margin before the transform."""
+    check_vector(forest)
     x = np.ascontiguousarray(x, dtype=np.float32)
     outs, margins = [], []
     for m in forest.models:
@@ -1008,7 +1271,10 @@ def ir_predict(forest: Forest, x: np.ndarray, average: str | None = None, base_m
         if base_margin is not None:
             marg = marg + np.asarray(base_margin, dtype=np.float64).reshape(len(x), -1) * m.margin_scale
         for t in m.trees:
-            marg[:, t.group] += tree_values(t, x).astype(np.float64)
+            if t.vector is not None:
+                marg += tree_values(t, x)
+            else:
+                marg[:, t.group] += tree_values(t, x).astype(np.float64)
         margins.append(marg)
         outs.append(transform_f64(marg, forest.kind))
     if (average or forest.average) == "margin":

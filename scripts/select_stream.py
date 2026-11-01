@@ -597,6 +597,8 @@ class LeafCodes:
     `extra_margin` the same over the extra rows given to the walk."""
 
     def __init__(self, codes, lv, leaf_off, margin, extra_margin, folder=None):
+        # `lv` is (total_leaves,) for scalar trees; a vector forest (W outputs per leaf) has (total_leaves, W): then `lm[i]` is (rows, W),
+        # `lm[ids]` (len(ids), rows, W) and `margin` / `extra_margin` hold the W sums of every row
         self.codes, self.lv = codes, lv
         self.leaf_off = leaf_off.astype(np.int32 if len(lv) < 2**31 - 1 else np.int64)  # int32 indexes: half the memory of a block read
         self.shape = codes.shape
@@ -608,11 +610,18 @@ class LeafCodes:
     def code_bytes(self) -> int:
         return int(self.codes.nbytes)
 
+    @property
+    def leaf_value_bytes(self) -> int:
+        """Bytes of the leaf values (`lv`): W times the scalar case for a vector forest, which `--memory-mb` has to count."""
+        return int(self.lv.nbytes)
+
     def __getitem__(self, ids):
         if isinstance(ids, (int, np.integer)):
             return self.lv[int(self.leaf_off[ids]) + self.codes[ids].astype(np.int64)]
         ids = np.asarray(ids)
-        return self.lv.take(self.leaf_off[ids][:, None] + self.codes[ids], mode="clip")  # the indexes are valid by construction
+        return self.lv.take(
+            self.leaf_off[ids][:, None] + self.codes[ids], axis=0 if self.lv.ndim == 2 else None, mode="clip"
+        )  # valid by construction
 
     def close(self):
         if isinstance(self.codes, FileRows):
@@ -771,6 +780,45 @@ def _num_trees(path: Path):
     return None
 
 
+def vector_leaf_width(path) -> int:
+    """The widest `size_leaf_vector` any tree of an xgboost file declares (1 for a one-output tree, W >= 2 for a multi-output tree), read
+    from the file's text or UBJSON without loading it; 1 when no tree says."""
+    widest = 1
+    with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+        i = mm.find(b"size_leaf_vector")
+        while i >= 0:
+            tail = bytes(mm[i + 16 : i + 48])
+            m = re.match(rb'"\s*:\s*"(\d+)"', tail)  # JSON: "size_leaf_vector":"2"
+            if m:
+                widest = max(widest, int(m.group(1)))
+            elif tail[:1] == b"S":  # UBJSON string value: marker, length, digits
+                try:
+                    n, q = _int_at(tail, 1)
+                    digits = tail[q : q + n]
+                    widest = max(widest, int(digits)) if digits.isdigit() else widest
+                except (ValueError, IndexError):
+                    pass
+            if widest > 1:
+                break
+            i = mm.find(b"size_leaf_vector", i + 16)
+    return widest
+
+
+def refuse_vector_leaves(path) -> None:
+    """The stream path walks scalar trees only. A model with vector leaves is refused here, in one line, BEFORE any scratch file is made."""
+    p = Path(path)
+    if p.suffix not in (".json", ".ubj") or not p.is_file():
+        return
+    try:
+        width = vector_leaf_width(p)
+    except (OSError, ValueError):
+        return
+    if width > 1:
+        raise ValueError(
+            f"{p.name}: a model with vector leaves ({width} values per leaf) cannot be read in a stream; prune it in memory: raise --memory-mb"
+        )
+
+
 def wanted(path, n_rows: int, memory_mb: int) -> bool:
     """Whether the in-memory path would need more than `memory_mb` for this xgboost file and this many selection rows: the float32 leaf
     matrix (4 bytes a tree and row), about 250 MB of working space, and the model parsed (about 10 times its JSON size; a .ubj is read as
@@ -785,4 +833,10 @@ def wanted(path, n_rows: int, memory_mb: int) -> bool:
         trees = None
     trees = trees if trees is not None else size / 2000
     as_json = size * (1.33 if p.suffix == ".ubj" else 1.0)
-    return 4 * trees * n_rows + (250 << 20) + 10 * as_json > memory_mb * 2**20
+    try:
+        width = vector_leaf_width(p)  # a vector forest adds only the (rows, W) sums to the scalar case
+    except (OSError, ValueError):
+        width = 1
+    # a vector forest never holds a (trees, rows, W) float array: `prune.vector_leaves` keeps one int32 leaf code a (tree, row), as the scalar
+    # case holds one float32, and only the (rows, W) sums (float64, a few copies of them) grow with W
+    return 4 * trees * n_rows + 24 * n_rows * width + (250 << 20) + 10 * as_json > memory_mb * 2**20

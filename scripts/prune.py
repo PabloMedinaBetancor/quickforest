@@ -41,6 +41,15 @@ def select_greedy(L, spec, k, rule, mean_scale, p_full, d_full, w=None):
     return [np.array(sorted(x)) for x in greedy_order(L, spec, k, rule, mean_scale, p_full, d_full, w)]
 
 
+def outputs_of(m, kind):
+    """The outputs of margins `m` for a kind that treats every output on its own (sigmoid, exp, identity)."""
+    if kind == "sigmoid":
+        return 1 / (1 + np.exp(-m))
+    if kind == "exp":
+        return np.exp(np.clip(m, -80, 80))
+    return m
+
+
 def best_in_block(L, spec, g, s_new, sums_g, eo, den_o, rule, d_full, p_full, w, reg, var, ch):
     """The best candidate of the trees `ch` (group g) at this greedy step -> (tree, score)."""
     mc = spec.base[g] + s_new * (sums_g[None, :] + L[ch])
@@ -48,13 +57,13 @@ def best_in_block(L, spec, g, s_new, sums_g, eo, den_o, rule, d_full, p_full, w,
         ec = np.exp(np.clip(mc, -80, 80))
         p = eo[None] / (ec + den_o[None])[..., None]
         p[..., g] = ec / (ec + den_o[None])
-    elif spec.kind == "sigmoid":
-        p = (1 / (1 + np.exp(-mc)))[..., None]
-    elif spec.kind == "exp":
-        p = np.exp(np.clip(mc, -80, 80))[..., None]
-    else:
-        p = mc[..., None]
-    mse = (((p - p_full[None]) * w[None, :, None]) ** 2).mean((1, 2))
+    elif eo is None:  # one output
+        p = outputs_of(mc, spec.kind)[..., None]
+    else:  # several independent outputs (xgboost one tree per output): group g's candidates next to the other groups' current outputs
+        q = outputs_of(mc, spec.kind)
+        p = np.repeat(eo[None].astype(q.dtype, copy=False), len(ch), 0)
+        p[..., g] = q
+    mse = (((p - p_full[None]) * w[None]) ** 2).mean((1, 2))
     if reg:
         score = -mse / var
     else:
@@ -88,7 +97,8 @@ def greedy_order(L, spec, k, rule, mean_scale, p_full, d_full, w=None, threads=1
     base = spec.base
     reg = spec.task == "regression"
     w = np.ones(n, np.float32) if w is None else w.astype(np.float32)  # regression: weights that turn errors into relative ones
-    var = float(((p_full * w[:, None]) ** 2).mean() if reg and w.any() else p_full.var()) or 1.0
+    w = w.reshape(n, -1)  # (rows, 1) or (rows, groups): a model of several regression outputs weighs every column on its own
+    var = float(((p_full * w) ** 2).mean() if reg and w.any() else p_full.var()) or 1.0
     for step in range(g_n * k):
         g = step % g_n
         s_new = total[g] / (len(kept[g]) + 1) if mean_scale else 1.0
@@ -100,6 +110,8 @@ def greedy_order(L, spec, k, rule, mean_scale, p_full, d_full, w=None, threads=1
         if spec.kind == "softmax":
             eo = np.exp(np.clip(mo, -80, 80))
             den_o = eo.sum(1) - eo[:, g]
+        elif g_n > 1:  # independent outputs: the others as they stand now, for the candidate's column to sit next to
+            eo = outputs_of(mo, spec.kind)
         cand = remaining[g]
         step_rows = candidate_block(n, g_n)
         score_one = partial(best_in_block, L, spec, g, s_new, sums[g], eo, den_o, rule, d_full, p_full, w, reg, var)
@@ -145,6 +157,8 @@ def group_margin(lm, spec):
     streamed forest (`select_stream.LeafCodes`) has added them already, in the same order."""
     if not isinstance(lm, np.ndarray):
         return spec.base[None, :] + lm.margin
+    if spec.vector_width:  # (trees, rows, W): every tree adds its whole leaf vector
+        return spec.base[None, :] + lm.sum(0, dtype=np.float64)
     cols = []
     for g in range(spec.groups):
         mine = spec.tree_info == g
@@ -195,6 +209,67 @@ def greedy_units_order(L, spec, unit_of, k, rule, p_full, d_full):
     return [ids[kept, g] for g in range(g_n)]
 
 
+def greedy_vector_order(L, spec, k, rule, mean_scale, p_full, d_full, w=None):
+    """Greedy selection for a forest of VECTOR trees (`spec.vector_width` = W): a vector tree is one unit that adds its whole leaf row to
+    all W output groups, so each step adds the tree whose addition most raises the decisions' agreement with the full model (a regression
+    model: lowers the weighted squared error, per entry). `L` hands out the (trees, rows, W) float32 leaf rows: `select_stream.LeafCodes`
+    (a small code per tree and row plus each tree's leaf table, as `vector_leaves` builds it) or a plain array; `p_full` (rows, W), `d_full`
+    the full model's decisions `rule(p_full)` ((rows,) or (rows, K)), `w` (rows, W) the weights that turn regression errors into relative
+    ones (None = ones). A mean-type model (random forest) is re-normalised by the number of kept trees. Returns, per group, the SAME
+    list of tree numbers in the order they were picked, so `kept[g]` and `--keep N` keep their meaning: N vector trees."""
+    (t_n, n), g_n = L.shape[:2], spec.groups
+    reg = spec.task == "regression"
+    w = np.ones((n, g_n), np.float32) if w is None else w.astype(np.float32).reshape(n, g_n)
+    var = float(((p_full * w) ** 2).mean() if reg and w.any() else p_full.var()) or 1.0
+    sums = np.zeros((n, g_n), np.float32)
+    remaining, picked = np.arange(t_n), []
+    step_rows = candidate_block(n, g_n)
+    for step in range(min(k, t_n)):
+        s_new = t_n / (step + 1) if mean_scale else 1.0
+        best, best_score = None, -np.inf
+        for a in range(0, len(remaining), step_rows):
+            ch = remaining[a : a + step_rows]
+            p = qf.transform(spec.base[None, None] + s_new * (sums[None] + L[ch]), spec.kind)
+            mse = (((p - p_full[None]) * w[None]) ** 2).mean((1, 2))
+            if reg:
+                score = -mse / var
+            else:
+                score = (rule(p) == d_full[None]).reshape(len(ch), -1).sum(1) - 0.5 * np.minimum(mse, 1.0)
+            i = int(np.argmax(score))
+            if score[i] > best_score:
+                best, best_score = int(ch[i]), float(score[i])
+        if best is None:
+            raise no_pick()
+        remaining = remaining[remaining != best]
+        picked.append(best)
+        sums += L[best]
+    return [np.array(picked, np.int64) for _ in range(g_n)]
+
+
+def vector_leaves(src, rows) -> select_stream.LeafCodes:
+    """The leaf provider of a vector forest as pruning reads it: the source's `leaf_codes(rows)` ((trees, rows) leaf ordinals) and
+    `leaf_vectors()` (one (leaves, W) table per tree) held as `LeafCodes`, so the (trees, rows, W) array of floats never exists; `margin`
+    is the float64 sum of the leaf rows, tree by tree in order. A source that only has `leaf_matrix` hands out the array itself."""
+    if not hasattr(src, "leaf_codes"):
+        return src.leaf_matrix(rows)
+    codes, tables = src.leaf_codes(rows), src.leaf_vectors()
+    off = np.zeros(len(tables) + 1, np.int64)
+    off[1:] = np.cumsum([len(t) for t in tables])
+    lv = np.concatenate(tables, 0).astype(np.float32, copy=False)
+    margin = np.zeros((len(rows), lv.shape[1]), np.float64)
+    for i in range(len(tables)):
+        margin += lv[off[i] + codes[i].astype(np.int64)]
+    return select_stream.LeafCodes(codes, lv, off[:-1], margin, None)
+
+
+def all_trees(src) -> list[np.ndarray]:
+    """Every tree of the model, per output group (a vector forest: the same list for every group, since a tree feeds them all)."""
+    spec = src.spec
+    if spec.vector_width:
+        return [np.arange(len(spec.nodes)) for _ in range(spec.groups)]
+    return [np.flatnonzero(spec.tree_info == g) for g in range(spec.groups)]
+
+
 def kept_indices(src, kept) -> dict:
     """Which trees of the ORIGINAL model a pruned copy keeps, as 0-based indices into the library's own tree list (xgboost `trees`, the
     LightGBM `Tree=` blocks, the YDF trees): `per_group` holds one sorted list per output group, `flat` one sorted list of all of them,
@@ -235,11 +310,36 @@ def meets_agreement(held: dict, bar: float) -> bool:
 
 
 def agreement(rule, p_a, p_b):
+    """How often two answers decide alike. With one decision per row that is the figure of 1.1. With K > 1 outputs (decisions
+    (rows, K)) `same`/`pct` are the WORST output's (every output must reach the bar), `same_per_output` / `agreement_pct_per_output`
+    list all of them, and `all_outputs_pct` counts the rows where every output agrees; a disagreement is a row where any output differs."""
     da, db = rule(p_a), rule(p_b)
     same = da == db
-    out = {"rows": len(same), "same": int(same.sum()), "pct": round(100 * float(same.mean()), 3) if len(same) else None}
-    out["mean_abs_output_diff"] = round(float(np.abs(p_a - p_b).mean()), 6) if len(same) else None
-    return out, np.where(~same)[0], da, db
+    if same.ndim == 1:
+        out = {"rows": len(same), "same": int(same.sum()), "pct": round(100 * float(same.mean()), 3) if len(same) else None}
+        out["mean_abs_output_diff"] = round(float(np.abs(p_a - p_b).mean()), 6) if len(same) else None
+        return out, np.where(~same)[0], da, db
+    n = len(same)
+    per = same.sum(0).astype(np.int64)
+    worst = int(per.min()) if len(per) else 0
+    out = {"rows": n, "same": worst, "pct": round(100 * worst / n, 3) if n else None}
+    out["same_per_output"] = [int(v) for v in per]
+    out["agreement_pct_per_output"] = [round(100 * int(v) / n, 3) if n else None for v in per]
+    out["all_outputs_pct"] = round(100 * float(same.all(1).mean()), 3) if n else None
+    out["mean_abs_output_diff"] = round(float(np.abs(p_a - p_b).mean()), 6) if n else None
+    return out, np.where(~same.all(1))[0], da, db
+
+
+def pooled_pct(figures: list[dict]) -> float:
+    """One agreement percent for the rows of several `agreement` figures together (the models of a folder). With K > 1 outputs it is the worst
+    output's over ALL the rows: the sum of each model's own worst output is not that (model A can be worst on output 0, model B on output 1,
+    and no output is worst everywhere), it understates the pooled figure."""
+    rows = sum(a["rows"] for a in figures)
+    if all("same_per_output" in a for a in figures) and figures:
+        same = min(sum(a["same_per_output"][k] for a in figures) for k in range(len(figures[0]["same_per_output"])))
+    else:
+        same = sum(a["same"] for a in figures)
+    return round(100 * same / max(1, rows), 3)
 
 
 def parse_keep(text: str, per_group: int) -> int:
@@ -336,12 +436,16 @@ def auto_report(rungs, chosen, whole, ladder, min_agreement, regression) -> dict
             "heldout_agreement_pct": h["pct"],
             "pass": r.get("passes", True),
         }
+        if "agreement_pct_per_output" in h:
+            out["agreement_pct_per_output"] = h["agreement_pct_per_output"]
         if r["regression"] is not None:
             g = r["regression"]
             out["regression"] = {
                 k: g[k] for k in ("median_pct", "p99_pct", "max_pct", "mae_full", "mae_pruned", "error_checked", "ok") if k in g
             }
             out["regression"]["failures"] = g["failures"]
+            if "per_output" in g:
+                out["regression"]["per_output"] = g["per_output"]
         return out
 
     bar = regression.describe() if regression else {"min_agreement_pct": min_agreement}
@@ -370,8 +474,17 @@ def auto_lines(r: dict) -> list[str]:
         if "regression" in g:
             q = g["regression"]
             figure = f"median {q['median_pct']} %, max {q['max_pct']} %"
+            failing = [f"output {o['output']}" for o in q.get("per_output", []) if not o["ok"]]  # K > 1: say which
         else:
             figure = f"held-out agreement {g['heldout_agreement_pct']} % on {g['heldout_rows']:,} rows"
+            per = g.get("agreement_pct_per_output")
+            failing = [f"output {j}" for j, v in enumerate(per or []) if v is None or v < a["bar"].get("min_agreement_pct", 0)]
+            if per:
+                figure += f", per output {per}"
+                if not g["pass"] and not failing:  # the rounded figure of the worst output sits on the bar: name it anyway
+                    failing = [f"output {j}" for j, v in enumerate(per) if v == min(per)]
+        if failing:
+            figure += f" (below the bar: {', '.join(failing)})"
         lines.append(
             f"  {g['keep']:>5}: {g['kept_per_group']} per group, {g['kept_trees']:,} trees, {g['nodes']:,} nodes, {figure}: "
             + ("PASS" if g["pass"] else "fail")
@@ -381,10 +494,62 @@ def auto_lines(r: dict) -> list[str]:
     return lines
 
 
+def is_model_path(model) -> bool:
+    """A path (str / PathLike) names a model file or folder; anything else is an estimator object handed over from Python."""
+    return isinstance(model, (str, bytes, os.PathLike))
+
+
+SKLEARN_TYPES = ("DecisionTreeRegressor", "DecisionTreeClassifier", "RandomForestRegressor", "RandomForestClassifier")
+SKLEARN_TYPES += ("ExtraTreesRegressor", "ExtraTreesClassifier")
+
+
+def export_estimator(est, folder: Path, data_path) -> tuple[Path, dict]:
+    """A fitted sklearn estimator -> `folder/model.qfsk` (verified against the estimator by `qf_sklearn.export_sklearn`, which refuses to
+    write on any difference) -> (the path, the export's result: `verified_rows`, `max_diff`, `normalised`). One-line `UsageError` for an
+    object that is not a supported fitted estimator, or when sklearn cannot be imported."""
+    kind = type(est).__name__
+    if not type(est).__module__.startswith("sklearn"):
+        raise qf.UsageError(f"model: {type(est).__module__}.{kind} is neither a model path nor a fitted sklearn estimator")
+    if kind not in SKLEARN_TYPES:
+        raise qf.UsageError(
+            f"sklearn {kind}: not supported; DecisionTree/RandomForest/ExtraTrees Regressor/Classifier only (see LIMITS for what is refused)"
+        )
+    try:
+        from sklearn.exceptions import NotFittedError
+        from sklearn.utils.validation import check_is_fitted
+    except ImportError:
+        raise qf.UsageError(
+            "model: a sklearn estimator was given but sklearn cannot be imported; install scikit-learn 1.3 or newer"
+        ) from None
+    try:
+        check_is_fitted(est)
+    except NotFittedError:
+        raise qf.UsageError(f"sklearn {kind} is not fitted: call fit first") from None
+    import qf_sklearn
+
+    folder.mkdir(parents=True, exist_ok=True)
+    rows = None if data_path is None else qf.load_data_cli(data_path)["X"][:20_000]  # real rows next to the probes the export builds
+    path = folder / "model.qfsk"
+    return path, dict(qf_sklearn.export_sklearn(est, path, X=rows))
+
+
+def check_truth(y, n_out: int, regression, task: str, name: str) -> None:
+    """The truth `y` must have one column per output of the model: shape (rows,) or (rows, 1) for one output, (rows, K) for K. Refused
+    in one line otherwise, when it is used. A K-target regression model without the regression bar does not read it, so only there a
+    different width goes unchecked."""
+    if y is None or (task == "regression" and not regression and n_out > 1):
+        return
+    try:
+        qf.require_truth_columns(y, n_out, name)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+
+
 def open_model(path, n_rows, memory_mb, scratch, threads=None):
     """The model as a source: the library's own reader, or, when that would need more than `memory_mb` for this many selection rows (an
     xgboost file with hundreds of thousands of trees), a `select_stream.StreamSource` that never holds the forest."""
     if select_stream.wanted(path, n_rows, memory_mb):
+        select_stream.refuse_vector_leaves(path)  # before the scratch folder exists: a refused model leaves nothing behind
         folder = tempfile.mkdtemp(prefix=".qf-scratch-", dir=scratch)
         with qf.refusing_damaged(path, "model", qf_formats.ModelFileError):
             return select_stream.StreamSource(
@@ -457,6 +622,9 @@ def run(
     threads=None,
 ) -> dict:
     t_start = time.perf_counter()
+    estimator = None if is_model_path(model) else model
+    if estimator is not None:  # a fitted sklearn estimator (Python only): exported and verified first, then everything runs on the file
+        model, exported = export_estimator(estimator, Path(out_dir) / "source", data_path)
     threads = None if threads is None else max(1, min(int(threads), 64))  # as everywhere: a count below 1 is one thread, and 64 at most
     check_options(
         sub=sub,
@@ -509,6 +677,8 @@ def run(
         report["params"].update(keep_ladder=list(ladder), min_agreement=min_agreement)
     if regression:
         report["params"]["regression"] = regression.describe()
+    if estimator is not None:
+        report["model"], report["library_diff"], report["export"] = str(files[0]), exported["max_diff"], exported
     labels = ladder if auto else (keep,)
     rung_root = out / "_rungs"  # --keep auto: every rung's pruned models, until the smallest passing one is chosen and moved up
     if auto and rung_root.exists():
@@ -521,6 +691,7 @@ def run(
         n_sel = min(max_sel_rows, int((sl == 0).sum()))
         cap_run = any(select_stream.wanted(f, n_sel, memory_mb) for f in files)
     rule = None
+    head_key = None  # what the first model of a folder looks like: the others must agree (they are averaged or pooled row by row)
     per_file = []  # per model file: the full model's held-out answers, and what each tried k per group gave
     try:
         for j, f in enumerate(files):
@@ -542,6 +713,26 @@ def run(
                 raise SystemExit(f"model {f.name}: needs selection rows and held-out rows (got {len(s_rows)} and {len(h_rows)})")
             if regression and spec.task != "regression":
                 raise SystemExit(f"{f.name}: the regression bar needs a regression model (this one is {spec.task})")
+            vec = (
+                spec.vector_width > 0
+            )  # vector trees: one selection unit adds a whole leaf row (tree_info carries no group: never read it)
+            segs = qf.decision_segments(spec.groups, spec.kind, spec.vector_width, getattr(src, "segments", None))
+            n_out = qf.truth_outputs(spec.groups, spec.kind, spec.task, spec.vector_width, getattr(src, "segments", None))
+            key = (
+                spec.n_features,
+                spec.groups,
+                spec.kind,
+                spec.task,
+                bool(vec),
+                n_out,
+                None if segs is None else tuple(np.ravel(segs).tolist()),
+            )
+            if head_key not in (None, key):
+                raise SystemExit(f"{f.name}: the models of the folder disagree on features, outputs, classes or objective")
+            head_key = key
+            check_truth(data.get("y"), n_out, regression, spec.task, f.name)
+            if vec and method != "greedy":
+                raise SystemExit(f"{f.name}: --method {method} is not available for multi-output (vector) trees; use greedy")
             pick = s_rows
             if sub < 1.0:
                 pick = np.sort(rng.choice(pick, max(1, int(sub * len(pick))), replace=False))
@@ -559,12 +750,18 @@ def run(
             if src.fmt != "xgboost" and scale != "auto":
                 raise SystemExit("--scale applies to xgboost only (LightGBM and YDF average their random forests themselves)")
             mean_scale = spec.rf if scale == "auto" else scale == "mean"
-            units = src.unit_of is not None and spec.groups > 1 and len(set(src.unit_of.tolist())) < len(src.unit_of)
-            per_group = int(np.bincount(spec.tree_info, minlength=spec.groups).min())
+            units = not vec and src.unit_of is not None and spec.groups > 1 and len(set(src.unit_of.tolist())) < len(src.unit_of)
+            per_group = len(spec.nodes) if vec else int(np.bincount(spec.tree_info, minlength=spec.groups).min())
+            single = getattr(src, "single_tree", False) or str(getattr(src, "fmt", "")).startswith("sklearn")
+            if per_group == 1 and single and not auto and not keeps_all(keep):
+                raise SystemExit(f"{f.name}: a single decision tree cannot be pruned (it has no trees to leave out); use --keep 100%")
             ks = {lab: parse_keep(lab, per_group) for lab in labels}
             k_max = max(ks.values())
             t1 = time.perf_counter()
-            lm = src.leaf_matrix(x[pick], extra=x[h_rows]) if streamed else src.leaf_matrix(x[pick])
+            if vec:
+                lm = vector_leaves(src, x[pick])
+            else:
+                lm = src.leaf_matrix(x[pick], extra=x[h_rows]) if streamed else src.leaf_matrix(x[pick])
             t_pre = time.perf_counter() - t1
             margin = group_margin(lm, spec)
             p_full = qf.transform(margin, spec.kind)
@@ -580,13 +777,16 @@ def run(
                     "scan_seconds": src.timings["scan"],
                 }
                 held_full = qf.transform(spec.base[None, :] + lm.extra_margin, spec.kind)
-            rule = qf.make_rule(decision, spec.groups, spec.kind, p_full, tol, spec.task)
+            rule = qf.make_rule(decision, spec.groups, spec.kind, p_full, tol, spec.task, segs)
             t2 = time.perf_counter()
             # one selection to the largest k: every smaller k is the front of the same order (auto reads all its rungs off it)
-            if method == "greedy" and units:
+            if method == "greedy" and vec:
+                w = None if not (regression and regression.space == "raw") else 1 / np.maximum(np.abs(p_full), 1e-9)
+                order = greedy_vector_order(lm, spec, k_max, rule, mean_scale, p_full, rule(p_full), w)
+            elif method == "greedy" and units:
                 order = greedy_units_order(lm, spec, src.unit_of, k_max, rule, p_full, rule(p_full))
             elif method == "greedy":
-                w = None if not (regression and regression.space == "raw") else 1 / np.maximum(np.abs(p_full[:, 0]), 1e-9)
+                w = None if not (regression and regression.space == "raw") else 1 / np.maximum(np.abs(p_full), 1e-9)
                 order = greedy_order(
                     lm,
                     spec,
@@ -615,7 +815,7 @@ def run(
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 src.save_pruned(kept, mean_scale, dest)
                 pruned = qf_formats.open_source(dest)
-                keep_ix = np.concatenate(kept)
+                keep_ix = kept[0] if vec else np.concatenate(kept)  # a vector tree feeds every group: counted once
                 pp_s, pp_h = pruned.predict(x[s_rows]), pruned.predict(x[h_rows])
                 a_sel, _, _, _ = agreement(rule, pf_s, pp_s)
                 a_held, _, _, _ = agreement(rule, pf_h, pp_h)
@@ -645,7 +845,7 @@ def run(
                 }
             if auto:  # the fallback of --keep auto, built from the full model itself: exact by construction
                 a_s, a_h = agreement(rule, pf_s, pf_s)[0], agreement(rule, pf_h, pf_h)[0]
-                every = [np.flatnonzero(spec.tree_info == g) for g in range(spec.groups)]
+                every = all_trees(src)
                 counts = library_counts(src, np.arange(len(spec.nodes)))
                 tries["whole"] = {
                     "pp_h": pf_h,
@@ -700,19 +900,24 @@ def run(
             ens, bad, df, dp = agreement(rule, pf, pp)
             ens["mode"] = "out-of-fold" if fold is not None else "mean of the models" + (" (margin)" if margin_avg else "")
             sel = [t["model"]["selection_agreement"] for t in picks]
-            ens["selection_pct"] = round(100 * sum(a["same"] for a in sel) / max(1, sum(a["rows"] for a in sel)), 3)
+            ens["selection_pct"] = pooled_pct(sel)
             # each model's own agreement on its held-out rows, pooled: the figure the selection one is compared with (several models
             # without a fold array are averaged into one ensemble figure, `pct`, which is another quantity)
             own = [t["model"]["heldout_agreement"] for t in picks]
-            ens["models_pct"] = round(100 * sum(a["same"] for a in own) / max(1, sum(a["rows"] for a in own)), 3)
+            ens["models_pct"] = pooled_pct(own)
             y = data.get("y")
             if y is not None and not regression and spec.task != "regression" and df.shape == y[rows].shape:
                 # the truth is given: how often the full and the pruned forest hit it (agreement with the full forest is not accuracy)
+                axis = 0 if df.ndim == 2 else None  # several outputs: the figure is the WORST output's, all of them listed
+                full_acc, pruned_acc = (df == y[rows]).mean(axis), (dp == y[rows]).mean(axis)
                 ens["accuracy"] = {
                     "rows": len(rows),
-                    "full_pct": round(100 * float((df == y[rows]).mean()), 3),
-                    "pruned_pct": round(100 * float((dp == y[rows]).mean()), 3),
+                    "full_pct": round(100 * float(np.min(full_acc)), 3),
+                    "pruned_pct": round(100 * float(np.min(pruned_acc)), 3),
                 }
+                if axis == 0:
+                    ens["accuracy"]["full_pct_per_output"] = [round(100 * float(v), 3) for v in full_acc]
+                    ens["accuracy"]["pruned_pct_per_output"] = [round(100 * float(v), 3) for v in pruned_acc]
             reg = None
             if regression:
                 reg = regression.check(pf, pp, None if y is None else y[rows].astype(np.float64))
@@ -757,13 +962,19 @@ def run(
     rows, pf, pp, bad, df, dp = (chosen[k] for k in ("rows", "pf", "pp", "bad", "df", "dp"))
     if regression:
         report["regression"] = chosen["regression"]
+    if regression and "per_output" in chosen["regression"]:
+        report["per_output"] = chosen["regression"][
+            "per_output"
+        ]  # K > 1 outputs: one dict each; the top-level figures are the worst output's
+    elif "agreement_pct_per_output" in chosen["heldout"]:
+        report["per_output"] = [{"output": j, "agreement_pct": a} for j, a in enumerate(chosen["heldout"]["agreement_pct_per_output"])]
     if auto:
         report["auto"] = auto_report(rungs, chosen, whole, ladder, min_agreement, regression)
     report["disagreements"] = [
         {
             "row": int(rows[i]),
-            "full": df[i].item(),
-            "pruned": dp[i].item(),
+            "full": df[i].tolist(),
+            "pruned": dp[i].tolist(),
             "p_full": np.round(pf[i], 4).tolist(),
             "p_pruned": np.round(pp[i], 4).tolist(),
         }
@@ -812,12 +1023,17 @@ def _summary(r: dict) -> str:
             f"pruned {len(r['models'])} model(s): nodes {t['nodes_before']:,} -> {t['nodes_after']:,} ({t['node_ratio']}x), "
             f"bytes {t['bytes_before']:,} -> {t['bytes_after']:,}; held-out |pruned - full| on {g['rows']:,} rows: median "
             f"{g['median_pct']} %, "
-            f"p99 {g['p99_pct']} %, max {g['max_pct']} %{err}; bars {'PASS' if g['ok'] else 'FAIL (' + '; '.join(g['failures']) + ')'}; "
+            f"p99 {g['p99_pct']} %, max {g['max_pct']} %{err}{' (the worst of ' + str(len(g['per_output'])) + ' outputs)' if 'per_output' in g else ''}; bars {'PASS' if g['ok'] else 'FAIL (' + '; '.join(g['failures']) + ')'}; "
             f"{t['seconds']} s"
         )
+    per = (
+        f" (worst of {len(h['agreement_pct_per_output'])} outputs {h['agreement_pct_per_output']}, all agree {h['all_outputs_pct']} %)"
+        if "agreement_pct_per_output" in h
+        else ""
+    )
     return (
         f"pruned {len(r['models'])} model(s): nodes {t['nodes_before']:,} -> {t['nodes_after']:,} ({t['node_ratio']}x), "
-        f"bytes {t['bytes_before']:,} -> {t['bytes_after']:,}; held-out agreement {h['pct']} % on {h['rows']:,} rows "
+        f"bytes {t['bytes_before']:,} -> {t['bytes_after']:,}; held-out agreement {h['pct']} %{per} on {h['rows']:,} rows "
         f"({h['rows'] - h['same']} disagree; selection rows {h['selection_pct']} %, so overfit "
         f"{h['selection_pct'] - h.get('models_pct', h['pct']):+.2f} points); {t['seconds']} s"
     )

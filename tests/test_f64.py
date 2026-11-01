@@ -759,5 +759,30 @@ class CAbiF64Test(unittest.TestCase):
         return art
 
 
+class VectorF64Test(unittest.TestCase):
+    """`compile --f64-leaves` with vector trees (K = 3 sklearn ExtraTrees regressor): the f64 file's answers equal the reference walk, which
+    is sklearn's own float64 `predict`, to 1e-12 relative."""
+
+    def test_k3_f64_leaves_match_the_double_reference(self):
+        try:
+            import joblib
+            import qf_sklearn
+        except ImportError:
+            self.skipTest("needs the sklearn reader (P2)")
+        fix = HERE / "fixtures" / "multi"
+        if not (fix / "et_reg_k3.joblib").exists():
+            self.skipTest("et_reg_k3.joblib is not in the checkout: run  python tests/make_multi_fixtures.py --group sklearn")
+        est, x = joblib.load(fix / "et_reg_k3.joblib"), np.load(fix / "et_reg_k3.npz")["x"]
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            qf_sklearn.export_sklearn(est, d / "m.qfsk", X=x[:500])
+            import compile as compile_mod
+
+            compile_mod.compile_model(d / "m.qfsk", d / "m.flat", backend="flat", f64_leaves=True)
+            got = evaluator.FlatForest(d / "m.flat").predict(x, dtype=np.float64)
+        want = est.predict(x)
+        np.testing.assert_allclose(got, want, rtol=1e-12, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,485 @@
+{
+ "info": {
+  "title": "compile-only table, several runs",
+  "machine": "x86_64",
+  "cpu": "Intel(R) Celeron(R) N4020 CPU @ 1.10GHz",
+  "logical_cpus": 2,
+  "os": "Linux 6.8.0-138-generic",
+  "threads_used": 1,
+  "baseline": "the source library's own predict, 1 thread (the compiled forest on the same 1)",
+  "batch_rows": 20000,
+  "date": "2026-10-31",
+  "python": "3.10.13",
+  "numpy": "2.2.6",
+  "xgboost": "3.2.0",
+  "lightgbm": "4.7.0",
+  "ydf": "0.16.1",
+  "size": "full",
+  "runs": 3,
+  "libs": "xgboost,lightgbm,ydf,ydf-rf",
+  "library_only": "sklearn-rf,xgboost-vector",
+  "note": ""
+ },
+ "runs": 3,
+ "threads": {
+  "1": {
+   "rows": {
+    "xgboost/flat": {
+     "library_rows_per_s_runs": [
+      13061,
+      12840,
+      13136
+     ],
+     "rows_per_s_runs": [
+      29246,
+      29085,
+      29147
+     ],
+     "speedup_runs": [
+      2.24,
+      2.27,
+      2.22
+     ],
+     "speedup_median": 2.239185360998392,
+     "max_err_worst": 0.0,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 2.48
+    },
+    "xgboost/wave": {
+     "library_rows_per_s_runs": [
+      13061,
+      12840,
+      13136
+     ],
+     "rows_per_s_runs": [
+      28409,
+      28347,
+      28542
+     ],
+     "speedup_runs": [
+      2.18,
+      2.21,
+      2.17
+     ],
+     "speedup_median": 2.175101447056121,
+     "max_err_worst": 0.0,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 2.48
+    },
+    "xgboost/codegen-block": {
+     "library_rows_per_s_runs": [
+      13061,
+      12840,
+      13136
+     ],
+     "rows_per_s_runs": [
+      38213,
+      38371,
+      38316
+     ],
+     "speedup_runs": [
+      2.93,
+      2.99,
+      2.92
+     ],
+     "speedup_median": 2.925733098537631,
+     "max_err_worst": 0.0,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 5.3
+    },
+    "lightgbm/flat": {
+     "library_rows_per_s_runs": [
+      11233,
+      10771,
+      10598
+     ],
+     "rows_per_s_runs": [
+      28540,
+      28630,
+      28496
+     ],
+     "speedup_runs": [
+      2.54,
+      2.66,
+      2.69
+     ],
+     "speedup_median": 2.658063318169158,
+     "max_err_worst": 5.399194369370974e-08,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 0.91
+    },
+    "lightgbm/codegen-block": {
+     "library_rows_per_s_runs": [
+      11233,
+      10771,
+      10598
+     ],
+     "rows_per_s_runs": [
+      65650,
+      65309,
+      65735
+     ],
+     "speedup_runs": [
+      5.84,
+      6.06,
+      6.2
+     ],
+     "speedup_median": 6.063411011048185,
+     "max_err_worst": 5.399194369370974e-08,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 2.69
+    },
+    "ydf/flat": {
+     "library_rows_per_s_runs": [
+      28870,
+      29142,
+      28837
+     ],
+     "rows_per_s_runs": [
+      99234,
+      99097,
+      99159
+     ],
+     "speedup_runs": [
+      3.44,
+      3.4,
+      3.44
+     ],
+     "speedup_median": 3.4372705230342917,
+     "max_err_worst": 5.364418029785156e-07,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 0.45
+    },
+    "ydf/codegen-block": {
+     "library_rows_per_s_runs": [
+      28870,
+      29142,
+      28837
+     ],
+     "rows_per_s_runs": [
+      157713,
+      157139,
+      157119
+     ],
+     "speedup_runs": [
+      5.46,
+      5.39,
+      5.45
+     ],
+     "speedup_median": 5.448520997329819,
+     "max_err_worst": 5.364418029785156e-07,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 1.51
+    },
+    "ydf-rf/flat": {
+     "library_rows_per_s_runs": [
+      27809,
+      27726,
+      27713
+     ],
+     "rows_per_s_runs": [
+      32119,
+      32089,
+      32209
+     ],
+     "speedup_runs": [
+      1.15,
+      1.16,
+      1.16
+     ],
+     "speedup_median": 1.157361321503282,
+     "max_err_worst": 8.344650268554688e-07,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 1.82
+    },
+    "ydf-rf/codegen-block": {
+     "library_rows_per_s_runs": [
+      27809,
+      27726,
+      27713
+     ],
+     "rows_per_s_runs": [
+      48676,
+      47949,
+      48732
+     ],
+     "speedup_runs": [
+      1.75,
+      1.73,
+      1.76
+     ],
+     "speedup_median": 1.7503685857096623,
+     "max_err_worst": 8.344650268554688e-07,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 1.73
+    }
+   },
+   "library_only": {
+    "sklearn-rf": {
+     "library_rows_per_s_runs": [
+      24264,
+      24213,
+      24177
+     ],
+     "threads": 1
+    },
+    "xgboost-vector": {
+     "library_rows_per_s_runs": [
+      24121461,
+      24646354,
+      24580046
+     ],
+     "threads": 1
+    }
+   }
+  },
+  "2": {
+   "rows": {
+    "xgboost/flat": {
+     "library_rows_per_s_runs": [
+      24209,
+      24759,
+      24796
+     ],
+     "rows_per_s_runs": [
+      44688,
+      44038,
+      44084
+     ],
+     "speedup_runs": [
+      1.85,
+      1.78,
+      1.78
+     ],
+     "speedup_median": 1.7786663435518397,
+     "max_err_worst": 0.0,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 2.48
+    },
+    "xgboost/wave": {
+     "library_rows_per_s_runs": [
+      24209,
+      24759,
+      24796
+     ],
+     "rows_per_s_runs": [
+      43592,
+      43989,
+      44532
+     ],
+     "speedup_runs": [
+      1.8,
+      1.78,
+      1.8
+     ],
+     "speedup_median": 1.7959348281980965,
+     "max_err_worst": 0.0,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 2.48
+    },
+    "xgboost/codegen-block": {
+     "library_rows_per_s_runs": [
+      24209,
+      24759,
+      24796
+     ],
+     "rows_per_s_runs": [
+      60099,
+      59036,
+      60632
+     ],
+     "speedup_runs": [
+      2.48,
+      2.38,
+      2.45
+     ],
+     "speedup_median": 2.445233102113244,
+     "max_err_worst": 0.0,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 5.3
+    },
+    "lightgbm/flat": {
+     "library_rows_per_s_runs": [
+      15223,
+      15301,
+      15482
+     ],
+     "rows_per_s_runs": [
+      43598,
+      43559,
+      43775
+     ],
+     "speedup_runs": [
+      2.86,
+      2.85,
+      2.83
+     ],
+     "speedup_median": 2.8468073982092674,
+     "max_err_worst": 5.399194369370974e-08,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 0.91
+    },
+    "lightgbm/codegen-block": {
+     "library_rows_per_s_runs": [
+      15223,
+      15301,
+      15482
+     ],
+     "rows_per_s_runs": [
+      99670,
+      99583,
+      91411
+     ],
+     "speedup_runs": [
+      6.55,
+      6.51,
+      5.9
+     ],
+     "speedup_median": 6.508267433501079,
+     "max_err_worst": 5.399194369370974e-08,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 2.69
+    },
+    "ydf/flat": {
+     "library_rows_per_s_runs": [
+      41607,
+      41486,
+      43746
+     ],
+     "rows_per_s_runs": [
+      151537,
+      151860,
+      154521
+     ],
+     "speedup_runs": [
+      3.64,
+      3.66,
+      3.53
+     ],
+     "speedup_median": 3.6421034922008317,
+     "max_err_worst": 5.364418029785156e-07,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 0.45
+    },
+    "ydf/codegen-block": {
+     "library_rows_per_s_runs": [
+      41607,
+      41486,
+      43746
+     ],
+     "rows_per_s_runs": [
+      292399,
+      238741,
+      292422
+     ],
+     "speedup_runs": [
+      7.03,
+      5.75,
+      6.68
+     ],
+     "speedup_median": 6.684542586750789,
+     "max_err_worst": 5.364418029785156e-07,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 1.51
+    },
+    "ydf-rf/flat": {
+     "library_rows_per_s_runs": [
+      41218,
+      40834,
+      41417
+     ],
+     "rows_per_s_runs": [
+      49513,
+      49098,
+      49880
+     ],
+     "speedup_runs": [
+      1.2,
+      1.2,
+      1.2
+     ],
+     "speedup_median": 1.202380369300093,
+     "max_err_worst": 8.344650268554688e-07,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 1.82
+    },
+    "ydf-rf/codegen-block": {
+     "library_rows_per_s_runs": [
+      41218,
+      40834,
+      41417
+     ],
+     "rows_per_s_runs": [
+      77441,
+      76825,
+      74859
+     ],
+     "speedup_runs": [
+      1.88,
+      1.88,
+      1.81
+     ],
+     "speedup_median": 1.8788150807899462,
+     "max_err_worst": 8.344650268554688e-07,
+     "status": [
+      "ok"
+     ],
+     "artifact_mb": 1.73
+    }
+   },
+   "library_only": {
+    "sklearn-rf": {
+     "library_rows_per_s_runs": [
+      32627,
+      33978,
+      32529
+     ],
+     "threads": 2
+    },
+    "xgboost-vector": {
+     "library_rows_per_s_runs": [
+      22769366,
+      23319730,
+      23401582
+     ],
+     "threads": 2
+    }
+   }
+  }
+ },
+ "seconds_total": 1573
+}

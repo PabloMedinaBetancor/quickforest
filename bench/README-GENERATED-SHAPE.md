@@ -1,7 +1,7 @@
 # Why generated code builds in the `fast` shape
 
 Generated code (`codegen-block`, `codegen-pgo`) is built with `-C opt-level=3 -C lto=off -C codegen-units=16`, and the profile-guided pass builds its
-instrumented binary and its final binary in that same shape. `--shape top` builds one codegen unit per chunk instead. This note is the measurement
+instrumented binary and its final binary in that same shape. `--shape top` (one codegen unit per chunk) was measured here and has since been removed: one codegen unit is never a default. This note is the measurement
 behind that default, with what it does not show.
 
 ## What was measured

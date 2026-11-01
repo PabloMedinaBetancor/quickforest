@@ -165,6 +165,87 @@ def train_ydf(x, y, folder: Path, classes: int, trees: int, depth: int, seed: in
     m.save(str(folder))
 
 
+def make_multi_targets(x, k: int, seed: int):
+    """(rows, k) float64 regression targets for the multi-output rows: the `make_data` generator with one score column per target."""
+    rng = np.random.default_rng(seed)
+    z = np.nan_to_num(x)
+    w = rng.normal(size=(x.shape[1], k))
+    score = np.tanh(z @ w * 0.4) + 0.6 * np.sin(z[:, :1] * z[:, 1:2]) + 0.25 * (z[:, 2:3] > 0.3) * z[:, 3:4]
+    return (score + rng.normal(size=score.shape) * 0.35) * 2 + 8.0
+
+
+def train_xgboost_vector(x, y, folder: Path, rounds: int, depth: int, seed: int):
+    """Row `xgboost-vector`: reg:squarederror with multi_strategy=multi_output_tree, K = y.shape[1] outputs, one vector tree per round."""
+    import xgboost as xgb
+
+    folder.mkdir(parents=True, exist_ok=True)
+    p = {
+        "objective": "reg:squarederror",
+        "multi_strategy": "multi_output_tree",
+        "tree_method": "hist",
+        "max_depth": depth,
+        "eta": 0.1,
+        "subsample": 0.8,
+        "nthread": os.cpu_count() or 1,
+        "verbosity": 0,
+        "seed": seed,
+    }
+    xgb.train(p, xgb.DMatrix(x, label=y), rounds).save_model(str(folder / "model.ubj"))
+
+
+def train_sklearn_rf(x, y, folder: Path, trees: int, depth: int, seed: int):
+    """Row `sklearn-rf`: RandomForestRegressor, K = y.shape[1] outputs. Writes model.joblib (the bench's own copy, for the library timing; QF
+    never reads it) and model.qfsk through QF's exporter (skipped with a note on a tree without `qf_sklearn`, i.e. before 1.2)."""
+    import joblib
+    from sklearn.ensemble import RandomForestRegressor
+
+    folder.mkdir(parents=True, exist_ok=True)
+    rf = RandomForestRegressor(n_estimators=trees, max_depth=depth, n_jobs=os.cpu_count() or 1, random_state=seed).fit(x, y)
+    joblib.dump(rf, folder / "model.joblib")
+    try:
+        import qf_sklearn
+    except ImportError:  # a tree before 1.2: the library-only timing needs just the joblib file
+        print("note: qf_sklearn not found, no model.qfsk written (library-only rows)")
+        return
+    qf_sklearn.export_sklearn(rf, str(folder / "model.qfsk"), X=x[:2000])
+
+
+def library_only_rate(lib: str, folder: Path, x, threads: int, runs: int = 3, reps: int = 2) -> list[float]:
+    """Rows/s of the library's own predict over BASELINE_ROWS rows, one value per run (best of `reps` passes each): the baseline of the
+    rows whose compiled side does not exist in the tree under test (1.1 cannot read sklearn or vector-leaf xgboost). Same batch and thread
+    rules as `qf_formats.library_rate`."""
+    import qf_formats
+
+    rows = qf_formats.BASELINE_ROWS
+    xs = np.ascontiguousarray(x)
+    xs = xs[:rows] if len(xs) >= rows else np.tile(xs, (-(-rows // len(xs)), 1))[:rows]
+    if lib.startswith("sklearn-rf"):
+        import joblib
+
+        m = joblib.load(folder / "model.joblib")
+        m.set_params(n_jobs=threads)
+        call = lambda: m.predict(xs)  # noqa: E731
+    elif lib.startswith("xgboost-vector"):
+        import xgboost as xgb
+
+        b = xgb.Booster(model_file=str(folder / "model.ubj"))
+        b.set_param({"nthread": threads})
+        d = xgb.DMatrix(xs)
+        call = lambda: b.predict(d)  # noqa: E731
+    else:
+        raise ValueError(lib)
+    call()  # warm-up
+    out = []
+    for _ in range(runs):
+        best = float("inf")
+        for _ in range(reps):
+            t = time.perf_counter()
+            call()
+            best = min(best, time.perf_counter() - t)
+        out.append(rows / best)
+    return out
+
+
 def save_selection(path: Path, x, folds_ids=None):
     d = {"X": np.ascontiguousarray(x, dtype=np.float32)}
     if folds_ids is not None:
@@ -184,6 +265,9 @@ def run(cmd: list[str], log: Path | None = None) -> float:
     return time.perf_counter() - t
 
 
+BASELINE_BUILD = ("compile_preset=1.0",)  # QF 1.0's build: the baseline of every figure in README-NUMBERS.md
+
+
 def compare(
     model: Path,
     data: Path,
@@ -194,7 +278,10 @@ def compare(
     cpu: int | None = None,
     stage: str = "all",
     threads: int = 1,
+    opts: tuple[str, ...] = BASELINE_BUILD,
 ):
+    """Runs scripts/compare.py. `opts` are its `--opt key=value` build options: by default QF 1.0's build (`compile_preset=1.0`), the one the figures in
+    README-NUMBERS.md were measured with, whatever the library's own default build is; pass `()` for the library's default build or other options."""
     cmd = [
         str(SCRIPTS / "compare.py"),
         str(model),
@@ -215,6 +302,8 @@ def compare(
         "--threads",
         str(threads),
     ]  # the library and the compiled forest are both timed on this many threads (compare.py defaults to all)
+    for o in opts:
+        cmd += ["--opt", o]
     if stage != "all":  # "build" compiles (needs rustc), "measure" times what was built, possibly on another machine
         cmd += ["--stage", stage]
     run(cmd, work.with_suffix(".log"))

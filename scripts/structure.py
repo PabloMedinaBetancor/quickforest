@@ -46,6 +46,11 @@ def export(model) -> dict[str, np.ndarray]:
     |x| <= 1e-35 the `default_left` way; LightGBM only), `leaf_index` (int32: the leaf's ordinal among the leaves of its tree in node
     order, -1 at an inner node).
 
+    A vector forest (a multi-class YDF random forest, a multi-output xgboost or sklearn model: one tree feeds every output group) writes
+    `tree_group` -1 for every tree, `n_groups` = the number of outputs W, and one more per-node array: `leaf_vector` (float32, (n_nodes, W):
+    the W values the leaf adds to the W groups, zeros at an inner node); `threshold` is 0 at its leaves. Its `source_tree` is the library's
+    tree, one per tree.
+
     A model with categorical splits or linear leaves cannot be written as these arrays and is refused with a ValueError."""
     files = qf_formats.model_files(model)
     if len(files) != 1:
@@ -58,11 +63,14 @@ def export(model) -> dict[str, np.ndarray]:
             raise ValueError(f"{path.name}: categorical splits cannot be exported as plain arrays (a split would need a set of categories)")
         if t.linear:
             raise ValueError(f"{path.name}: linear leaves cannot be exported as plain arrays (a leaf is a function of the row)")
+    vector = [t.vector is not None for t in ir.trees]
+    if any(vector) and not all(vector):
+        raise ValueError(f"{path.name}: scalar and vector trees in one model cannot be exported as one set of arrays")
     unit_of = getattr(src, "unit_of", None)
     n = len(ir.trees)
     sizes = np.array([len(t.left) for t in ir.trees], dtype=np.int64)
     leaf = np.concatenate([t.left == -1 for t in ir.trees])
-    leaf_index = np.concatenate([np.where(t.left == -1, np.cumsum(t.left == -1) - 1, -1) for t in ir.trees])
+    leaf_index = np.concatenate([np.where(t.left == -1, qf.leaf_ordinal(t.left), -1) for t in ir.trees])
     out: dict[str, np.ndarray] = {
         "format": np.array(src.fmt),
         "kind": np.array(src.spec.kind),
@@ -83,6 +91,8 @@ def export(model) -> dict[str, np.ndarray]:
         & ~leaf,
         "leaf_index": leaf_index.astype(np.int32),
     }
+    if any(vector):
+        out["leaf_vector"] = np.concatenate([t.vector for t in ir.trees]).astype(np.float32)
     return out
 
 

@@ -32,8 +32,11 @@ from tiled import tiled
 FIX = HERE / "fixtures"
 BITS = np.uint32
 # Tests use the fastest compile: only the checks of the defaults themselves build with the defaults (opt-level 3, x86-64-v2,
-# profile-guided); every other build here asks for opt-level 0, whose answers must be the same bit for bit.
-FAST = {"opt_level": 0}
+# profile-guided, the 1.1 preset); every other build here asks for opt-level 0 and the 1.0 preset (no LTO, 16 codegen units: the cheapest build),
+# whose answers must be the same bit for bit.
+FAST = {"opt_level": 0, "compile_preset": "1.0"}
+ONE_UNIT = {"compile_preset": "1.0", "lto": "off", "codegen_units": 1, "opt_level": 0}  # one codegen unit exists only when asked by hand
+OPT0 = {"opt_level": 0}  # opt-level 0 under the default preset: the build of the tests of the default itself
 
 
 def forest(name: str):
@@ -76,8 +79,8 @@ class TargetCpuTest(unittest.TestCase):
         for be in (bc.CodegenBackend(), bc.CodegenBlockBackend(), bc.CodegenPgoBackend()):
             self.assertEqual(be.opt_level, 3, be.name)
         self.assertIn("opt 3", self.info["default"]["note"])
-        self.assertIn(f"shape {bc.DEFAULT_SHAPE}", self.info["default"]["note"])
-        self.assertIn(f"{bc.SHAPES[bc.DEFAULT_SHAPE]} codegen units", self.info["default"]["note"])
+        self.assertIn(f"build {bc.describe_compile(bc.DEFAULT_COMPILE)}", self.info["default"]["note"])
+        self.assertIn(f"{bc.DEFAULT_COMPILE['codegen_units']} codegen units", self.info["default"]["note"])
 
     def test_the_default_is_the_portable_cpu_and_the_result_names_it(self):
         self.assertEqual(bc.default_cpu(), "x86-64-v2" if bc.ARCH in ("x86_64", "amd64") else "generic")
@@ -402,8 +405,9 @@ class ProfileGateTest(unittest.TestCase):
 
 
 class BuildShapeTest(unittest.TestCase):
-    """The default build is the fast shape (opt 3, no LTO, 16 codegen units, the profile pass in the same shape); `top` is one unit; the jobs and
-    units are planned against the free RAM and the build never swaps."""
+    """The default build is the QF 1.1 preset (opt 3, fat LTO, 16 codegen units, inline 3000, the profile pass in the same shape); `fast` is QF 1.0's
+    build (no LTO, 16 codegen units); one unit is built only when asked by hand; the jobs and units are planned against the free RAM and the build never swaps.
+    The settings themselves are tested in test_compile_settings.py."""
 
     @classmethod
     def setUpClass(cls):
@@ -417,24 +421,50 @@ class BuildShapeTest(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def build(self, tag, opts, backend=bc.CodegenBlockBackend):
+    def build(self, tag, opts, backend=bc.CodegenBlockBackend, base=FAST):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            info = backend().compile(self.f, self.tmp / f"{tag}.so", {**FAST, **opts})
+            info = backend().compile(self.f, self.tmp / f"{tag}.so", {**base, **opts})
         return info, err.getvalue()
 
-    def test_the_default_shape_is_fast(self):
-        self.assertEqual(bc.DEFAULT_SHAPE, "fast")
-        default, _ = self.build("default", {})
-        self.assertEqual((default["shape"], default["codegen_units"]), (bc.DEFAULT_SHAPE, bc.SHAPES[bc.DEFAULT_SHAPE]))
+    def test_the_default_build_is_the_1_1_preset(self):
+        self.assertEqual(bc.DEFAULT_COMPILE_PRESET, "1.1")
+        default, _ = self.build("default", {}, base=OPT0)
+        self.assertEqual(
+            (default["compile_preset"], default["lto"], default["codegen_units"], default["inline_threshold"]), ("1.1", "fat", 16, 3000)
+        )
 
-    def test_fast_is_16_units_top_is_one_and_the_answers_are_the_same(self):
-        self.assertEqual(bc.SHAPES, {"fast": 16, "top": 1})
+    def test_opt_level_0_loads_in_every_build_shape_and_answers_as_opt_level_3(self):
+        """rustc builds opt-level 0 with overflow checks, which call core's `panic_const_*`; the fat-LTO link of the driver drops those, and the library
+        did not load (`undefined symbol`). Opt-level 0 is built with the checks off, in every shape a user can ask for, and answers as opt-level 3."""
+        want = bc.CodegenForest(self.build("opt3", {"opt_level": 3, "compile_preset": "1.0"})[0]["artifact"]).predict(self.x, 1)
+        for tag, opts in (
+            ("default-chunks", {"compile_preset": "1.1", "unit": "chunks"}),  # fat LTO on the link, inline 3000, one unit: the 1.1 default
+            ("default-single", {"compile_preset": "1.1", "unit": "single"}),
+            ("fat-16-units", {"compile_preset": "1.1", "lto": "fat", "codegen_units": 16, "inline_threshold": 0}),
+            ("no-lto", {"compile_preset": "1.1", "lto": "off"}),
+            ("fat-1.0", {"lto": "fat"}),
+        ):
+            with self.subTest(tag):
+                info, _ = self.build(tag, opts)
+                self.assertIn("overflow checks and debug assertions off", info["note"])
+                self.assertTrue(same_bits(bc.CodegenForest(info["artifact"]).predict(self.x, 1), want))
+        info, _ = self.build("opt3-note", {"opt_level": 3})
+        self.assertNotIn("overflow checks", info["note"])  # opt-level 1 and up are built as rustc builds them
+
+    def test_the_chunk_flags_turn_the_checks_off_at_opt_level_0_only(self):
+        for opt in (1, 2, 3):
+            self.assertNotIn("overflow-checks=off", bc.chunk_flags(opt, bc.resolve_compile({}), 1))
+        flags = bc.chunk_flags(0, bc.resolve_compile({}), 1)
+        self.assertIn("overflow-checks=off", flags)
+        self.assertIn("debug-assertions=off", flags)
+
+    def test_fast_is_16_units_one_unit_only_by_hand_and_the_answers_are_the_same(self):
+        self.assertEqual(bc.SHAPES, {"fast": 16})
         fast, _ = self.build("fast", {"shape": "fast"})
-        top, _ = self.build("top", {"shape": "top"})
+        top, _ = self.build("top", ONE_UNIT)
         self.assertEqual((fast["shape"], fast["codegen_units"]), ("fast", 16))
-        self.assertEqual((top["shape"], top["codegen_units"]), ("top", 1))
-        self.assertIn("shape top", top["note"])
+        self.assertEqual((top["shape"], top["codegen_units"]), ("custom", 1))
         want = bc.CodegenForest(self.tmp / "top.so").predict(self.x, 1)
         got = bc.CodegenForest(self.tmp / "fast.so").predict(self.x, 1)
         self.assertTrue(same_bits(got, want), "the shape changes how the code is built, never its answers")
@@ -442,7 +472,7 @@ class BuildShapeTest(unittest.TestCase):
     def test_the_units_are_real_the_trees_sit_in_modules_and_rustc_makes_one_object_per_unit(self):
         """`-C codegen-units=16` splits nothing in a source of a single module, so the fast shape spreads the trees over modules."""
         fast, _ = self.build("fast-src", {"keep_src": True, "shape": "fast"})
-        top, _ = self.build("top-src", {"keep_src": True, "shape": "top"})
+        top, _ = self.build("top-src", {"keep_src": True, **ONE_UNIT})
         try:
             src_f, src_t = Path(fast["src_dir"]), Path(top["src_dir"])
             self.assertIn("mod g0 {", (src_f / "c0.rs").read_text())
@@ -474,32 +504,34 @@ class BuildShapeTest(unittest.TestCase):
             seen.append(list(cmd))
             return real(cmd, env, watch)
 
-        for shape in ("fast", "top"):
+        for shape, units, shape_opts in (("fast", 16, {"shape": "fast"}), ("top", 1, ONE_UNIT)):
             seen.clear()
             with mock.patch.object(bc, "run_measured", spy), contextlib.redirect_stderr(io.StringIO()):
-                bc.CodegenPgoBackend().compile(self.f, self.tmp / "same.so", {**FAST, "shape": shape, "pgo_rows": str(self.pgo_rows)})
+                bc.CodegenPgoBackend().compile(self.f, self.tmp / "same.so", {**FAST, **shape_opts, "pgo_rows": str(self.pgo_rows)})
             shape_of = lambda c: [a for a in c if a.startswith(("opt-level=", "codegen-units=", "lto="))]  # noqa: E731
             gen = [shape_of(c) for c in seen if any(a.startswith("profile-generate=") for a in c) and "obj" in c]
             use = [shape_of(c) for c in seen if any(a.startswith("profile-use=") for a in c) and "obj" in c]
             self.assertTrue(gen and use, shape)
             self.assertEqual({tuple(g) for g in gen} | {tuple(u) for u in use}, {tuple(gen[0])}, shape)
-            self.assertIn(f"codegen-units={bc.SHAPES[shape]}", gen[0])
+            self.assertIn(f"codegen-units={units}", gen[0])
             self.assertIn("lto=off", gen[0])
-            # the driver's link is part of the shape too (`top` is one codegen unit EVERYWHERE), the same in the instrumented and the final build
+            # the driver's link is part of the shape too (one codegen unit, asked by hand, is one EVERYWHERE), the same in the instrumented and the final build
             driver = lambda c: [a for a in c if a.startswith(("codegen-units=", "lto="))]  # noqa: E731
             d_gen = [driver(c) for c in seen if "cdylib" in c and any(a.startswith("profile-generate=") for a in c)]
             d_use = [driver(c) for c in seen if "cdylib" in c and any(a.startswith("profile-use=") for a in c)]
             self.assertEqual((len(d_gen), len(d_use)), (1, 1), shape)
             self.assertEqual(d_gen, d_use, shape)
-            self.assertEqual(d_gen[0], ["codegen-units=1"] if shape == "top" else [], shape)  # fast: rustc's defaults, top: one unit
+            self.assertEqual(d_gen[0], ["codegen-units=1"] if units == 1 else [], shape)  # fast: rustc's defaults, by hand: one unit
 
     def test_an_unknown_shape_is_refused_in_one_line(self):
-        with self.assertRaisesRegex(ValueError, r"--shape 'turbo': give fast .* or top"):
+        with self.assertRaisesRegex(ValueError, r"--shape 'turbo': give fast"):
             bc.resolve_shape({"shape": "turbo"})
         with self.assertRaises(ValueError):
             qf_compile.compile_model(FIX / "xgb_multi.ubj", self.tmp / "no.so", "codegen-block", shape="turbo")
+        with self.assertRaisesRegex(ValueError, "--shape top: removed"):
+            bc.resolve_shape({"shape": "top"})
         with self.assertRaisesRegex(ValueError, "not generated code"):
-            qf_compile.compile_model(FIX / "xgb_multi.ubj", self.tmp / "no2.bin", "flat", shape="top")
+            qf_compile.compile_model(FIX / "xgb_multi.ubj", self.tmp / "no2.bin", "flat", shape="fast")
 
     def test_the_plan_keeps_the_wanted_jobs_and_units_when_they_fit(self):
         est = bc.rustc_peak_estimate_mb
@@ -920,7 +952,7 @@ class BestBackendTest(unittest.TestCase):
         self.assertTrue(rep["stages"]["verify"]["ok"])
         self.assertTrue((self.tmp / "opt-best" / "model.so").is_file())
         self.assertIn(
-            f"compile (codegen-pgo, built for {bc.default_cpu()} CPU, {bc.DEFAULT_SHAPE} shape)",
+            f"compile (codegen-pgo, built for {bc.default_cpu()} CPU, {bc.describe_compile(bc.DEFAULT_COMPILE)})",
             (self.tmp / "opt-best" / "report.md").read_text(),
         )
 

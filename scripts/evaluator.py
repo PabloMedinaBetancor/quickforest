@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import itertools
 import operator
 import os
 import platform
@@ -75,6 +76,8 @@ def load_lib(path: Path) -> ctypes.CDLL:
             fn.restype, fn.argtypes = restype, argtypes
     except AttributeError as e:
         raise ValueError(f"{shown(path)} is not a build of this repository's evaluator ({e}): build it with rust/build.sh") from None
+    if hasattr(lib, "tfl_segments"):  # builds before format 7 lack it; they refuse a format-7 file before anyone asks
+        lib.tfl_segments.restype, lib.tfl_segments.argtypes = u32, [p, p, sz]
     _LOADED[digest] = lib
     return lib
 
@@ -235,6 +238,29 @@ class EngineRefused(RuntimeError):
     A RuntimeError."""
 
 
+def read_segments(lib: ctypes.CDLL, handle) -> list[int] | None:
+    """The output segments a format-7 file carries (`[0, c_1, c_1 + c_2, ..., groups]`), or None when it has none."""
+    if not hasattr(lib, "tfl_segments"):
+        return None
+    n = lib.tfl_segments(handle, None, 0)
+    if n == 0:
+        return None
+    offsets = (ctypes.c_uint32 * (n + 1))()
+    if lib.tfl_segments(handle, offsets, n + 1) != n:
+        raise ValueError("the library returned a different number of output segments the second time")
+    return list(offsets)
+
+
+def output_layout(objective: int, n_groups: int, segments: list[int] | None) -> tuple[int, str]:
+    """(n_outputs, output_kind) of a forest from what its file says. Segments name the outputs: all of width 1 under the identity objective
+    are K regression columns, anything else is K classifier blocks. A file without segments is one output: a regression for the identity
+    or exp objective with a single group, a classification otherwise (sigmoid, softmax, or the class shares of a random forest)."""
+    if segments:
+        widths = np.diff(segments)
+        return len(widths), "regression" if objective == 0 and (widths == 1).all() else "classification"
+    return 1, "regression" if objective in (0, 3) and n_groups == 1 else "classification"
+
+
 class NotCopyable:
     """A loaded forest owns a library handle: `copy.copy` would share the raw handle (two `tfl_close` calls free it twice, and a copy used
     after the original is closed reads freed memory), so copying, deep-copying and pickling are refused with one line. Load the file again."""
@@ -243,6 +269,36 @@ class NotCopyable:
         raise TypeError(f"{type(self).__name__} owns a library handle and cannot be copied or pickled: load the file again")
 
     __copy__ = __deepcopy__ = __reduce__ = _refuse
+
+
+def segment_decisions(p: np.ndarray, segments) -> np.ndarray:
+    """Outputs (..., G) -> one integer per output (..., K): argmax inside each segment, `p >= 0.5` for a segment of width 1."""
+    cols = [(p[..., a] >= 0.5) if b - a == 1 else p[..., a:b].argmax(-1) for a, b in itertools.pairwise(segments)]
+    return np.stack(cols, -1).astype(np.int64)
+
+
+def split_outputs(p, groups: int, segments, kind: str) -> list[np.ndarray]:
+    """The answer of a compiled forest, `(rows, groups)` (or `(rows,)` for one group), as one array per OUTPUT: a classifier gives
+    `p[:, segments[k]:segments[k+1]]` (sklearn's `predict_proba` list; without segments one block), a regressor one column each."""
+    p = np.asarray(p)
+    if p.ndim == 1:
+        p = p[:, None]
+    if p.ndim != 2 or p.shape[1] != groups:
+        raise ValueError(f"split_outputs: this forest answers {groups} column(s) per row, got an array of shape {p.shape}")
+    if kind == "classification":
+        seg = segments if segments is not None else [0, groups]
+        return [p[:, a:b] for a, b in itertools.pairwise(seg)]
+    return [p[:, k] for k in range(groups)]
+
+
+def argmax_outputs(p, groups: int, segments, kind: str) -> np.ndarray:
+    """The decision of a classifier, `(rows, K)` integers: the rule the bars use (argmax inside each output's segment, `p >= 0.5` for a
+    width-1 one)."""
+    if kind != "classification":
+        raise ValueError("argmax_outputs is for classifiers; this forest is a regressor (use split_outputs)")
+    split_outputs(p, groups, segments, kind)  # the width check
+    p = np.asarray(p)
+    return segment_decisions(p.reshape(len(p), -1), segments if segments is not None else [0, groups])
 
 
 class FlatForest(NotCopyable):
@@ -270,6 +326,8 @@ class FlatForest(NotCopyable):
         self._lib.tfl_info(self._h, info)
         self.n_features, self.n_groups, self.n_folds, self.n_trees, self.n_nodes, self.objective, self.average = info
         self.margin_scale = self._lib.tfl_margin_scale(self._h)  # read by the library from the image it verified (rust/src/lib.rs)
+        self.segments = read_segments(self._lib, self._h)
+        self.n_outputs, self.output_kind = output_layout(self.objective, self.n_groups, self.segments)
 
     def predict(self, x, threads: int | None = None, base_margin=None, dtype=np.float32) -> np.ndarray:
         """`threads`: None (default) = every usable core from PARALLEL_MIN_ROWS rows on, one below; an integer forces that many (1..64).
@@ -307,8 +365,8 @@ class FlatForest(NotCopyable):
                     f"{shown(self.path.name)}: engine {self.engine} (the wavefront engines) cannot evaluate this file, which holds "
                     f"double-precision sums "
                     "(a LightGBM forest, or a YDF one not compiled with --float32-sums), extended nodes (categorical or zero-as-missing "
-                    "splits) "
-                    "or linear leaves; use engine=0 (the lock-step walker: backend flat) or the generated code (codegen-block)"
+                    "splits), "
+                    "linear leaves or vector leaves (one leaf adding several output values); use engine=0 (the lock-step walker: backend flat) or the generated code (codegen-block)"
                 )
             if bad:
                 raise RuntimeError(f"tfl_predict failed ({bad})")
@@ -318,6 +376,17 @@ class FlatForest(NotCopyable):
                 self._busy -= 1
                 if not self._busy and self._h is None:
                     self._idle.notify_all()  # a close() is waiting for the last prediction
+
+    def split_outputs(self, p):
+        """`predict` answer -> one array per output (a classifier: sklearn's `predict_proba` list; a regressor: one column each)."""
+        return split_outputs(p, self.n_groups, getattr(self, "segments", None), self._output_kind())
+
+    def argmax_outputs(self, p):
+        """`predict` answer of a classifier -> (rows, K) integer decisions (argmax inside each output's segment, p >= 0.5 for a width-1 one)."""
+        return argmax_outputs(p, self.n_groups, getattr(self, "segments", None), self._output_kind())
+
+    def _output_kind(self) -> str:
+        return getattr(self, "output_kind", "classification" if self.n_groups > 1 else "regression")
 
     def close(self):
         """Frees the forest. New predictions are refused from now on; one already running in another thread finishes first (close waits

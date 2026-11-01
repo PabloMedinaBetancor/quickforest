@@ -1,0 +1,170 @@
+{
+ "disagreements": [
+  {
+   "full": 0,
+   "p_full": [
+    0.47
+   ],
+   "p_pruned": [
+    0.5
+   ],
+   "pruned": 1,
+   "row": 75
+  },
+  {
+   "full": 0,
+   "p_full": [
+    0.4
+   ],
+   "p_pruned": [
+    0.5
+   ],
+   "pruned": 1,
+   "row": 1433
+  },
+  {
+   "full": 0,
+   "p_full": [
+    0.42
+   ],
+   "p_pruned": [
+    0.5333
+   ],
+   "pruned": 1,
+   "row": 2177
+  },
+  {
+   "full": 1,
+   "p_full": [
+    0.53
+   ],
+   "p_pruned": [
+    0.4
+   ],
+   "pruned": 0,
+   "row": 2971
+  }
+ ],
+ "heldout": {
+  "mean_abs_output_diff": 0.024114,
+  "mode": "mean of the models",
+  "models_pct": 99.723,
+  "pct": 99.723,
+  "rows": 1443,
+  "same": 1439,
+  "selection_pct": 99.872
+ },
+ "kept_indices": {
+  "ydf_rf_binary": {
+   "flat": [
+    4,
+    6,
+    8,
+    10,
+    11,
+    14,
+    18,
+    21,
+    24,
+    30,
+    33,
+    35,
+    38,
+    40,
+    41,
+    42,
+    51,
+    56,
+    57,
+    58,
+    60,
+    62,
+    63,
+    64,
+    68,
+    73,
+    75,
+    94,
+    96,
+    99
+   ],
+   "original_trees": 100,
+   "per_group": [
+    [
+     4,
+     6,
+     8,
+     10,
+     11,
+     14,
+     18,
+     21,
+     24,
+     30,
+     33,
+     35,
+     38,
+     40,
+     41,
+     42,
+     51,
+     56,
+     57,
+     58,
+     60,
+     62,
+     63,
+     64,
+     68,
+     73,
+     75,
+     94,
+     96,
+     99
+    ]
+   ]
+  }
+ },
+ "models": [
+  {
+   "bytes_after": 99533,
+   "bytes_before": 396334,
+   "file": "ydf_rf_binary",
+   "format": "ydf",
+   "heldout_agreement": {
+    "mean_abs_output_diff": 0.024114,
+    "pct": 99.723,
+    "rows": 1443,
+    "same": 1439
+   },
+   "kept_per_group": 30,
+   "kept_trees": 30,
+   "nodes_after": 1706,
+   "nodes_before": 5664,
+   "rf": true,
+   "selection_agreement": {
+    "mean_abs_output_diff": 0.023258,
+    "pct": 99.872,
+    "rows": 1557,
+    "same": 1555
+   },
+   "selection_rows": 1557,
+   "trees": 100
+  }
+ ],
+ "params": {
+  "decision": "argmax",
+  "keep": "30%",
+  "method": "greedy",
+  "scale": "auto",
+  "seed": 15,
+  "sub": 1.0
+ },
+ "totals": {
+  "bytes_after": 99533,
+  "bytes_before": 396334,
+  "node_ratio": 3.32,
+  "nodes_after": 1706,
+  "nodes_before": 5664
+ }
+}

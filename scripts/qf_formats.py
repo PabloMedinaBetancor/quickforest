@@ -4,6 +4,7 @@ adapter that reads it into the neutral forest (`qf_common.ModelIR`) and can writ
     xgboost   .ubj / .json            XgbSource (here)
     LightGBM  text model (`tree` ...) qf_lgb.LgbSource
     YDF       model folder            qf_ydf.YdfSource  (imports `ydf` lazily, at build time only)
+    sklearn   .qfsk export            qf_sklearn.SklearnSource  (numpy arrays written by qf_sklearn.export_sklearn; never a pickle)
 
 A Source has: `fmt`, `path`, `spec` (qf_common.Spec), `leaf_matrix(x)` -> (trees, rows) float32 holding each tree's share of the
 full sum, `predict(x, margin=False)` -> (rows, groups) the library's own answer, `model_ir()`, `save_pruned(kept, mean_scale, dest)`,
@@ -38,6 +39,13 @@ def is_lgb_file(p: Path) -> bool:
         raise ModelFileError(f"{p}: {e.strerror}") from None
 
 
+PICKLE_SUFFIXES = (".pkl", ".pickle", ".joblib")
+
+
+def is_qfsk(p: Path) -> bool:
+    return p.suffix == ".qfsk" and p.is_file()
+
+
 def natural(f: Path):
     return [int(t) if t.isdecimal() else t.casefold() for t in re.split(r"(\d+)", f.name)]  # fold0, Fold1, fold2 are in that order
 
@@ -52,15 +60,23 @@ class ModelFileError(ValueError, SystemExit):
         self.code = message
 
 
+def _pickle_refusal(p: Path) -> str:
+    return f"{p}: a pickle is never read; export the sklearn model with qf_sklearn.export_sklearn(model, 'model.qfsk') and use that file"
+
+
 def detect(path: Path) -> str:
     p = Path(path)
     if is_ydf_dir(p):
         return "ydf"
     if is_lgb_file(p):
         return "lightgbm"
+    if p.suffix == ".qfsk":
+        return "sklearn"
+    if p.suffix in PICKLE_SUFFIXES:  # unpickling runs code from the file
+        raise ModelFileError(_pickle_refusal(p))
     if p.suffix in (".ubj", ".json"):
         return "xgboost"
-    raise ModelFileError(f"{p}: not an xgboost (.ubj/.json), LightGBM (text) or YDF (folder) model")
+    raise ModelFileError(f"{p}: not an xgboost (.ubj/.json), LightGBM (text), YDF (folder) or sklearn (.qfsk) model")
 
 
 @contextlib.contextmanager
@@ -91,6 +107,11 @@ def _open_source(path):
     if fmt == "xgboost":
         with malformed(path, fmt):
             return XgbSource(Path(path))
+    if fmt == "sklearn":
+        import qf_sklearn
+
+        with malformed(path, fmt):
+            return qf_sklearn.SklearnSource(Path(path))
     if fmt == "lightgbm":
         import qf_lgb
 
@@ -138,7 +159,7 @@ def is_xgb_json(f: Path) -> bool:
 
 
 def is_model_file(f: Path) -> bool:
-    return (f.suffix == ".ubj" and f.is_file()) or is_xgb_json(f) or is_lgb_file(f) or is_ydf_dir(f)  # a pipe is never opened
+    return (f.suffix in (".ubj", ".qfsk") and f.is_file()) or is_xgb_json(f) or is_lgb_file(f) or is_ydf_dir(f)  # a pipe is never opened
 
 
 def model_files(path) -> list[Path]:
@@ -151,6 +172,12 @@ def model_files(path) -> list[Path]:
     if not p.is_dir():  # a FIFO, a device or a socket: listing it would raise NotADirectoryError, reading it could block
         raise ModelFileError(f"{p}: not a model file or folder (a pipe or a device is not read)")
     files = [f for f in p.iterdir() if is_model_file(f)]
+    exported = {f.stem.casefold() for f in files}
+    for f in sorted(
+        p.iterdir(), key=natural
+    ):  # a pickle fold with no export beside it would be skipped, and the ensemble averaged without it
+        if f.suffix in PICKLE_SUFFIXES and f.is_file() and f.stem.casefold() not in exported:
+            raise ModelFileError(_pickle_refusal(f))
     if not files:
         raise ModelFileError(f"{p}: no xgboost, LightGBM or YDF model files")
     files = sorted(files, key=natural)
@@ -213,8 +240,35 @@ class XgbSource:
         return self.path.stat().st_size
 
     def leaf_matrix(self, x):
+        if self.spec.vector_width:  # `spec.vals` holds the sentinel at a vector leaf: the table lookup would answer 1e-45 for every leaf
+            raise ValueError(f"{self.name}: a model with vector leaves has no scalar leaf matrix; use leaf_codes and leaf_vectors")
         qf.check_width(x, self.spec.n_features, self.name)
         return qf.leaf_matrix(self.booster, self.spec, x)
+
+    def leaf_codes(self, x, chunk: int = 4096) -> np.ndarray:
+        """(trees, rows) int32 for a vector-leaf model: the ordinal of the leaf each row ends in, among the leaves of its tree in node order
+        (the row of `leaf_vectors()[i]`)."""
+        if not self.spec.vector_width:
+            raise ValueError(f"{self.name}: only a model with vector leaves has leaf codes; use leaf_matrix")
+        qf.check_width(x, self.spec.n_features, self.name)
+        ordinal = [qf.leaf_ordinal(t["left_children"]) for t in self._trees]
+        out = np.empty((len(self._trees), len(x)), np.int32)
+        for a in range(0, len(x), chunk):
+            part = np.ascontiguousarray(x[a : a + chunk], dtype=np.float32)
+            node = (
+                self.booster.predict(qf.xgb().DMatrix(part), pred_leaf=True, validate_features=False)
+                .reshape(len(part), -1)
+                .astype(np.int64)
+            )
+            for i, o in enumerate(ordinal):
+                out[i, a : a + chunk] = o[node[:, i]]
+        return out
+
+    def leaf_vectors(self) -> list[np.ndarray]:
+        """Per tree, the (leaves, W) float32 table the codes of `leaf_codes` index."""
+        if not self.spec.vector_width:
+            raise ValueError(f"{self.name}: only a model with vector leaves has leaf vectors; use leaf_matrix")
+        return [t["leaf_vector"][np.asarray(t["left_children"]) == -1] for t in self._trees]
 
     def set_threads(self, n: int) -> None:
         self.booster.set_param({"nthread": n})
@@ -242,12 +296,24 @@ def xgb_tree(t: dict, group: int) -> qf.Tree:
     left, right = np.asarray(t["left_children"], dtype=np.int32), np.asarray(t["right_children"], dtype=np.int32)
     feature, value = np.asarray(t["split_indices"], dtype=np.int32), np.asarray(t["split_conditions"], dtype=np.float32)
     default_left = np.asarray(t["default_left"], dtype=bool)
+    vector = t.get("leaf_vector")  # a vector-leaf tree as `qf.vector_leaf_view` gives it; its leaves hold 0 in `value`
+    if vector is not None:
+        value = np.where(left == -1, np.float32(0), value)
     live = qf.reachable_nodes(left, right)
     if not live.all():
         new = np.cumsum(live) - 1
         left, right = np.where(left[live] == -1, -1, new[left[live]]), np.where(right[live] == -1, -1, new[right[live]])
         feature, value, default_left = feature[live], value[live], default_left[live]
-    return qf.Tree(group, left.astype(np.int32), right.astype(np.int32), feature, value, default_left)
+        vector = None if vector is None else vector[live]
+    return qf.Tree(
+        group if vector is None else qf.VECTOR_GROUP,
+        left.astype(np.int32),
+        right.astype(np.int32),
+        feature,
+        value,
+        default_left,
+        vector=vector,
+    )
 
 
 # Attributes xgboost saves after early stopping that name rounds of the model they were written for. The scikit-learn wrapper predicts with
@@ -269,7 +335,11 @@ def prune_doc(j: dict, spec, kept, mean_scale, trees=None) -> bytes:
     model = j["learner"]["gradient_booster"]["model"]
     source = model["trees"] if trees is None else trees
     g_n, k = spec.groups, len(kept[0])
-    order = sorted(np.concatenate(kept).tolist()) if spec.rf else [int(kept[g][r]) for r in range(k) for g in range(g_n)]
+    vector = spec.vector_width > 0
+    if vector:  # a vector tree feeds every group: kept[g] is the same list for all of them and each tree is written once
+        order = [int(i) for i in kept[0]]
+    else:
+        order = sorted(np.concatenate(kept).tolist()) if spec.rf else [int(kept[g][r]) for r in range(k) for g in range(g_n)]
     out = []
     totals = np.bincount(spec.tree_info, minlength=g_n)
     for i, t in enumerate(order):
@@ -277,22 +347,28 @@ def prune_doc(j: dict, spec, kept, mean_scale, trees=None) -> bytes:
         if mean_scale:
             scale = np.float32(totals[spec.tree_info[t]] / k)
             leaf = np.asarray(tree["left_children"]) == -1
-            for key in ("split_conditions", "base_weights"):
-                v = np.asarray(tree[key], dtype=np.float32)
-                v[leaf] *= scale
-                tree[key] = v.tolist()
+            if vector:  # the sentinel in split_conditions stays; base_weights has W values per node
+                rows = np.asarray(tree["base_weights"], dtype=np.float32).reshape(len(leaf), -1)
+                rows[leaf] *= scale
+                tree["base_weights"] = rows.ravel().tolist()
+                tree["leaf_weights"] = (np.asarray(tree["leaf_weights"], dtype=np.float32) * scale).tolist()
+            else:
+                for key in ("split_conditions", "base_weights"):
+                    v = np.asarray(tree[key], dtype=np.float32)
+                    v[leaf] *= scale
+                    tree[key] = v.tolist()
         tree["id"] = i
         out.append(tree)
     model["trees"] = out
     model["tree_info"] = [int(spec.tree_info[t]) for t in order]
     model["gbtree_model_param"]["num_trees"] = str(len(out))
     model["gbtree_model_param"]["num_parallel_tree"] = str(k if spec.rf else 1)
-    model["iteration_indptr"] = [0, len(out)] if spec.rf else list(range(0, len(out) + 1, g_n))
+    model["iteration_indptr"] = [0, len(out)] if spec.rf else list(range(0, len(out) + 1, 1 if vector else g_n))
     # raw UTF-8, not \u escapes: xgboost's JSON reader keeps an escape as the six characters, so a feature called `prix` with an e-acute came back with a literal backslash-u escape in its name
     return json.dumps(j, ensure_ascii=False).encode()
 
 
-def spec_for(n_features, groups, kind, base, tree_info, nodes, mean_type, task="auto") -> qf.Spec:
+def spec_for(n_features, groups, kind, base, tree_info, nodes, mean_type, task="auto", vector_width=0) -> qf.Spec:
     """A Spec for the formats that need no xgboost-style leaf table (`off` and `vals` are unused by them)."""
     nodes = np.asarray(nodes, dtype=np.int64)
     return qf.Spec(
@@ -307,4 +383,5 @@ def spec_for(n_features, groups, kind, base, tree_info, nodes, mean_type, task="
         parallel=1,
         task=task,
         mean_type=mean_type,
+        vector_width=vector_width,
     )

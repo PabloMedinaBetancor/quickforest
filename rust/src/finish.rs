@@ -67,10 +67,13 @@ impl Acc for f32 {
             }
             SIGMOID => {
                 // xgboost's `common::Sigmoid`: `x = std::min(-x, 88.7f)` (so a NaN margin stays NaN: `std::min` returns its first argument
-                // unless the second is smaller, which `f32::min` does not), then `1.0f / (expf(x) + 1.0f + 1e-16f)`
-                let x = -m[0];
-                let x = if 88.7f32 < x { 88.7f32 } else { x };
-                m[0] = 1.0 / (x.exp() + 1.0 + 1e-16f32);
+                // unless the second is smaller, which `f32::min` does not), then `1.0f / (expf(x) + 1.0f + 1e-16f)`. Several groups (format
+                // 7 only: xgboost multilabel) take it per column.
+                for v in m.iter_mut() {
+                    let x = -*v;
+                    let x = if 88.7f32 < x { 88.7f32 } else { x };
+                    *v = 1.0 / (x.exp() + 1.0 + 1e-16f32);
+                }
             }
             EXP => m.iter_mut().for_each(|v| *v = v.exp()),
             _ => debug_assert_eq!(objective, IDENTITY),
@@ -113,7 +116,8 @@ impl Acc for f64 {
                     *v /= sum;
                 }
             }
-            SIGMOID => m[0] = 1.0 / (1.0 + (-m[0]).exp()),
+            // per column when there are several groups (format 7 only)
+            SIGMOID => m.iter_mut().for_each(|v| *v = 1.0 / (1.0 + (-*v).exp())),
             EXP => m.iter_mut().for_each(|v| *v = v.exp()),
             _ => debug_assert_eq!(objective, IDENTITY),
         }

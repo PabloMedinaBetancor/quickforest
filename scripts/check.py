@@ -18,9 +18,11 @@ before the objective's transform, and the library gets the same numbers.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -31,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import backend_codegen
 import backends
 import evaluator
+import prune
 import qf_common as qf
 import qf_formats
 
@@ -185,8 +188,20 @@ def path_rows(forest: qf.Forest, n: int, seed: int) -> np.ndarray:
     return np.clip(np.array(rows, f32).reshape(-1, nf), -big, big)  # NaN stays
 
 
-def ambiguous(decision: str, p: np.ndarray, groups: int) -> np.ndarray:
-    """Rows whose decision sits within float noise of a boundary: a difference there is not an error of the evaluator."""
+def ambiguous(decision: str, p: np.ndarray, groups: int, segments=None) -> np.ndarray:
+    """Rows whose decision sits within float noise of a boundary: a difference there is not an error of the evaluator. With `segments`
+    (a model of K > 1 outputs) the answer is (rows, K): every output is judged inside its own segment."""
+    if decision == "argmax" and segments is not None and len(segments) > 2:
+        cols = []
+        for a, b in itertools.pairwise(segments):
+            if b - a == 1:
+                cols.append(np.abs(p[:, a] - 0.5) <= 2 * TOL)
+            else:
+                top = np.sort(p[:, a:b], axis=1)
+                cols.append((top[:, -1] - top[:, -2]) <= 2 * TOL)
+        return np.stack(cols, 1)
+    if segments is not None and len(segments) > 2:
+        return np.zeros((len(p), len(segments) - 1), bool)  # a rule file: no boundary known
     if decision == "argmax" and groups > 1:
         top = np.sort(p, axis=1)
         return (top[:, -1] - top[:, -2]) <= 2 * TOL
@@ -194,6 +209,22 @@ def ambiguous(decision: str, p: np.ndarray, groups: int) -> np.ndarray:
         t = 0.5 if decision == "argmax" else float(decision.split(":", 1)[1])
         return np.abs(p[:, 0] - t) <= 2 * TOL
     return np.zeros(len(p), bool)
+
+
+def estimator_answer(est, x: np.ndarray) -> np.ndarray:
+    """What a fitted sklearn estimator answers for `x`, laid out like the compiled forest's columns: a regressor its outputs, a classifier
+    the class probabilities of every output side by side."""
+    if hasattr(est, "predict_proba"):
+        p = est.predict_proba(x)
+        return np.hstack(p if isinstance(p, list) else [p]).astype(np.float64)
+    return np.asarray(est.predict(x), np.float64).reshape(len(x), -1)
+
+
+def estimator_diff(est, x: np.ndarray, ref: np.ndarray) -> float:
+    want, got = estimator_answer(est, x), ref.reshape(len(ref), -1).astype(np.float64)
+    if want.shape != got.shape:
+        raise ValueError(f"the estimator answers {want.shape[1]} column(s) per row, the exported forest {got.shape[1]}")
+    return float((np.abs(want - got) / np.maximum(1.0, np.abs(want))).max()) if len(want) else 0.0
 
 
 def bit_exact(files, average: str, forest, margin: bool = False) -> bool:
@@ -207,13 +238,13 @@ def bit_exact(files, average: str, forest, margin: bool = False) -> bool:
     )
 
 
-def compare(name, ref, got, decision, rule, groups, absolute=False, exact=False):
+def compare(name, ref, got, decision, rule, groups, absolute=False, exact=False, segments=None):
     ref, got = ref.reshape(len(ref), -1), got.reshape(len(got), -1)
     scale = 1.0 if absolute else np.maximum(1.0, np.abs(ref))  # relative to max(1, |value|) unless the caller wants an absolute bar
     err = float((np.abs(ref - got) / scale).max()) if len(ref) else 0.0
     out = {"set": name, "rows": len(ref), "max_err": err}
     if rule is not None:
-        skip = ambiguous(decision, ref, groups)
+        skip = ambiguous(decision, ref, groups, segments)
         diff = (rule(ref) != rule(got)) & ~skip
         out.update(decision_mismatches=int(diff.sum()), ambiguous_skipped=int(skip.sum()))
     else:
@@ -305,6 +336,11 @@ def run(
         raise ValueError(f"--random {n_random}: the number of random rows cannot be negative")
     if not data and not n_random:
         raise ValueError("nothing to test: give --data, or leave --random above 0")
+    estimator = None if prune.is_model_path(model) else model  # a fitted sklearn estimator: exported (verified) first, judged against too
+    export_dir = None
+    if estimator is not None:
+        export_dir = tempfile.TemporaryDirectory(prefix="qf-check-")
+        model, _ = prune.export_estimator(estimator, Path(export_dir.name), data)
     files = qf_formats.model_files(model)
     be = ArtifactLoader if backend is None else backends.get(backend)
     pred = be.load(Path(artifact))
@@ -318,6 +354,7 @@ def run(
     if data:
         d = qf.load_data_cli(data)
         qf.check_width(d["X"], forest.n_features, data)
+        qf.require_truth_columns(d.get("y"), qf.forest_truth_outputs(forest), data)
         sets.append(("data", d["X"][:max_rows]))
         if margin and "base_margin" in d:
             margins["data"] = np.asarray(d["base_margin"], np.float64).reshape(len(d["X"]), -1)[:max_rows]
@@ -330,16 +367,18 @@ def run(
     # `xgb` does. Not judged that way: a base margin (xgboost adds it in its own float32 order), and several folds averaged as a margin
     # through a sigmoid / softmax (the reference applies numpy's float32 transform, xgboost the C library's).
     exact = bit_exact(files, average, forest, margin)
-    results = []
+    results, library_diff = [], 0.0
+    segs, rule = qf.forest_segments(forest), qf.forest_rule(decision, forest)  # once: a rule file is loaded and probed on every build
     for name, x in sets:
         if margin and name not in margins:
             margins[name] = np.random.default_rng(seed + 1).uniform(-3, 3, (len(x), forest.groups))
         bm = margins.get(name)
         ref = qf.reference_predict(files, x, average, bm)
-        rule = qf.make_rule(decision, forest.groups, forest.kind, None, None, forest.task) if forest.task == "classification" else None
         kw = ({"base_margin": bm} if bm is not None else {}) | ({"dtype": np.float64} if f64 else {})
         got = pred.predict(x, *(() if threads is None else (threads,)), **kw)  # None: the backend's own default (all cores)
-        results.append({**compare(name, ref, got, decision, rule, forest.groups, absolute, exact), "base_margin": bm is not None})
+        if estimator is not None and bm is None:
+            library_diff = max(library_diff, estimator_diff(estimator, x, ref))
+        results.append({**compare(name, ref, got, decision, rule, forest.groups, absolute, exact, segs), "base_margin": bm is not None})
     out = {
         "ok": all(r["ok"] for r in results),
         "bar": ("identical to the bit" if exact else f"max {'absolute' if absolute else 'relative'} err <= {TOL}")
@@ -347,6 +386,11 @@ def run(
         + (" (float64 output)" if f64 else ""),
         "sets": results,
     }
+    if estimator is not None:
+        out["library_diff"] = (
+            library_diff  # QF's reference walk of the exported arrays against the estimator's own answer, relative to max(1, |v|)
+        )
+        export_dir.cleanup()
     if speed and sets:
         # real rows when the caller gave them: the threshold-hugging random rows walk unlikely, deep paths and run about twice as slow
         basis, rows = next(((n, x) for n, x in sets if n == "data"), sets[-1])

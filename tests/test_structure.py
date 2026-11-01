@@ -62,7 +62,8 @@ def ydf_frame(x, y):
 def tree_slices(a: dict, wanted: list[int]) -> list[dict]:
     """The listed trees of an export, each as its own slice of every per-node array."""
     off = a["node_offset"]
-    return [{k: a[k][off[t] : off[t + 1]] for k in NODE_ARRAYS} | {"group": int(a["tree_group"][t])} for t in wanted]
+    keys = NODE_ARRAYS + (("leaf_vector",) if "leaf_vector" in a else ())
+    return [{k: a[k][off[t] : off[t + 1]] for k in keys} | {"group": int(a["tree_group"][t])} for t in wanted]
 
 
 def walk_margin(a: dict, x: np.ndarray) -> np.ndarray:
@@ -88,7 +89,10 @@ def walk_margin(a: dict, x: np.ndarray) -> np.ndarray:
             go_left = np.where(zm[node] & (np.abs(v.astype(np.float64)) <= zero), dl[node], go_left)
             pos = np.where(leaf, pos, np.where(go_left, left[node], right[node]))
         g = int(a["tree_group"][t])
-        margin[:, g] = margin[:, g] + thr[pos].astype(dtype)
+        if g == -1:  # a vector tree adds its leaf's W values to the W groups
+            margin = margin + a["leaf_vector"][lo:hi][pos].astype(dtype)
+        else:
+            margin[:, g] = margin[:, g] + thr[pos].astype(dtype)
     return margin
 
 
@@ -202,14 +206,20 @@ class KeptIndicesTest(Base):
             self.assertEqual(lst, sorted(set(lst)), f"{name}: a list of kept indices is sorted and has no repeat")
             self.assertTrue(all(isinstance(i, int) and 0 <= i < ki["original_trees"] for i in lst), name)
         self.assertEqual(ki["flat"], sorted(set().union(*ki["per_group"])), name)
+        vec = "leaf_vector" in orig  # a vector forest: one tree feeds every group (tree_group -1), the same kept list for every group
+        self.assertEqual(vec, "leaf_vector" in pruned, name)
         for g in range(groups):
             mine = [
-                t for t in range(len(orig["tree_group"])) if orig["tree_group"][t] == g and orig["source_tree"][t] in ki["per_group"][g]
+                t
+                for t in range(len(orig["tree_group"]))
+                if (vec or orig["tree_group"][t] == g) and orig["source_tree"][t] in ki["per_group"][g]
             ]
-            theirs = [t for t in range(len(pruned["tree_group"])) if pruned["tree_group"][t] == g]
+            theirs = [t for t in range(len(pruned["tree_group"])) if vec or pruned["tree_group"][t] == g]
             self.assertEqual(len(mine), len(ki["per_group"][g]), f"{name} group {g}: one exported tree per kept library tree")
             self.assertEqual(len(mine), len(theirs), f"{name} group {g}: the pruned file holds exactly the kept trees")
-            ratio = sum(orig["tree_group"] == g) / len(theirs)  # a random forest's leaves are rescaled by trees / kept
+            ratio = (len(orig["tree_group"]) if vec else sum(orig["tree_group"] == g)) / len(
+                theirs
+            )  # a random forest's leaves are rescaled by trees / kept
             for t_orig, t_pruned in zip(tree_slices(orig, mine), tree_slices(pruned, theirs), strict=True):
                 for key in NODE_ARRAYS:
                     a, b = t_orig[key], t_pruned[key]
@@ -224,6 +234,8 @@ class KeptIndicesTest(Base):
                             np.testing.assert_allclose(
                                 a[~inner] * ratio, b[~inner], rtol=2e-6, err_msg=f"{name} group {g}: rescaled leaves"
                             )
+                    elif key == "leaf_vector":
+                        np.testing.assert_allclose(a * ratio, b, rtol=2e-6, err_msg=f"{name} group {g}: rescaled leaf vectors")
                     else:
                         np.testing.assert_array_equal(a, b, f"{name} group {g}: {key}")
 
@@ -256,7 +268,7 @@ class KeptIndicesTest(Base):
                 src = qf_formats.open_source(case["path"])
                 unit_of = getattr(src, "unit_of", None)
                 for g, lst in enumerate(everything["per_group"]):
-                    in_group = np.flatnonzero(src.spec.tree_info == g)
+                    in_group = np.arange(len(src.spec.nodes)) if src.spec.vector_width else np.flatnonzero(src.spec.tree_info == g)
                     self.assertEqual(
                         lst, sorted({int(i) for i in (in_group if unit_of is None else unit_of[in_group])}), f"{name} group {g}"
                     )
@@ -384,10 +396,18 @@ class StructureExportTest(Base):
         )
 
     @unittest.skipUnless(HAS_YDF, "ydf is not installed")
-    def test_a_ydf_random_forest_is_one_exported_tree_per_class_and_names_its_library_tree(self):
+    def test_a_ydf_random_forest_is_one_vector_tree_per_library_tree_and_names_it(self):
         a = structure.export(self.fx.cases["ydf rf multiclass"]["path"])
-        self.assertEqual(a["tree_group"].tolist(), [g for _ in range(16) for g in range(3)])
-        self.assertEqual(a["source_tree"].tolist(), [u for u in range(16) for _ in range(3)])
+        self.assertEqual(int(a["n_groups"]), 3)
+        self.assertEqual(a["tree_group"].tolist(), [-1] * 16)  # 1.2: one vector tree per library tree, it feeds every class
+        self.assertEqual(a["source_tree"].tolist(), list(range(16)))
+        self.assertEqual(a["leaf_vector"].shape, (len(a["left"]), 3))
+        leaf = a["left"] == -1
+        np.testing.assert_allclose(
+            a["leaf_vector"][leaf].sum(1), 1.0 / 16, atol=1e-7
+        )  # class shares of a leaf, already divided by the 16 trees
+        self.assertFalse(a["leaf_vector"][~leaf].any(), "an inner node holds no leaf vector")
+        self.assertFalse(a["threshold"][leaf].any(), "the scalar leaf value of a vector tree's leaf is 0")
         b = structure.export(self.fx.cases["ydf rf binary"]["path"])
         self.assertEqual((len(b["tree_group"]), b["source_tree"].tolist()), (16, list(range(16))))
 

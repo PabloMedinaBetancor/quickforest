@@ -53,11 +53,24 @@ base margin and `--float32-sums` regression stayed at or below 6e-8 in the float
 
 ## Refused (with a one-line reason, never a wrong answer)
 
-- xgboost: categorical splits, `dart` and `gblinear` boosters, vector leaves; objectives other than binary:logistic, reg:logistic, multi:softprob, reg:squarederror.
+- xgboost: categorical splits, `dart` and `gblinear` boosters; objectives other than binary:logistic, reg:logistic, multi:softprob, reg:squarederror. Vector leaves
+  (`multi_strategy=multi_output_tree`) are read since 1.2, except `num_target >= 2` together with `num_class >= 2` and the reduced-gradient mode (a tree whose
+  `base_weights` do not hold one vector per node). `multi_strategy=one_output_per_tree` with a sigmoid objective and several targets (multilabel) is refused at read: train with `multi_output_tree`. Scalar forests of f64 or linear leaves with several regression outputs (no reader produces one) keep a flat file without segment table.
+- scikit-learn (1.2): only `DecisionTree`, `RandomForest` and `ExtraTrees`, `Regressor` or `Classifier`, fitted, scikit-learn 1.3 or newer. GradientBoosting, HistGradientBoosting
+  and Bagging are refused, and so is a pickle or joblib file: QuickForest never loads one (unpickling runs code from the file); export the fitted object from Python with
+  `qf_sklearn.export_sklearn` or hand it to `optimize` / `prune` / `check` as the model. A single DecisionTree cannot be pruned below 100 % (no trees to leave out). A classification output with
+  one class is refused; so are more than 1,024 output values.
+- LightGBM: no multi-output trees (LightGBM has none; one model per target).
+- Vector-leaf xgboost models do not go through the streaming path: a vector-leaf model too big for `--memory-mb` is refused with a line that says to raise it.
+- `--decision threshold:T` on a model of several outputs (the rule needs one output; use a rule file, which returns one integer per output, shape `(..., K)`).
+- A compiled tree whose right child is more than 65,535 nodes after its parent (the node format; the compiler says so).
 - LightGBM: multiclassova, cross_entropy_lambda, regression with `reg_sqrt`, custom objectives; a `sigmoid:s` whose s is not a finite number above zero (LightGBM refuses it too); a categorical split with an empty category set.
 - A model with no trees (xgboost trained for zero rounds).
 - YDF: categorical, boolean, discretised and oblique features or conditions; losses other than the supported ones; a boosted model saved with
   `apply_link_function=False` (its `predict` answers the margin, not the probabilities or the Poisson rate the loss implies).
+- `compile` to an OUT whose name does not end in `.so` writes the shared object there with no `OUT.choice.json`; `backends.load_artifact` then says "not a treeflat file (magic)". Name the output `*.so` (generated code) or `*.flat`.
+- Pruning a regression model WITHOUT `--regression` is not refused: it is judged by the classifier rule (`p >= 0.5`, or the argmax; per output when K > 1), a figure that means nothing for a regression. Pass `--regression log|raw`.
+- Wording left as it was in 1.2: `compile --help` names only xgboost, LightGBM and YDF; one error message repeats the file name (`data.npz: data.npz: ...`); the no-model-files error omits scikit-learn; `--method orientation` on a multi-class K = 1 model mentions "multi-output (vector) trees".
 - `prune` and `optimize` on a model file called `report.json` or `heldout_probs.npz` (any case): the report written next to the pruned models would replace it.
 - Linear-leaf forests: not pruned (compile them whole), and the wave engines refuse them; use the walker or the generated-code backends.
 - `--float32-sums` on anything but YDF.
@@ -77,6 +90,8 @@ base margin and `--float32-sums` regression stayed at or below 6e-8 in the float
 
 ## Pruning
 
+- Several outputs (1.2): every output must pass the bar (argmax inside each classifier output's block, a width-1 output `p >= 0.5`, a regressor output binned on its own
+  column), and the figures are measured on synthetic data only; no real multi-output model has been pruned yet.
 - Pruning keeps DECISION agreement with the full ensemble, not accuracy against the truth. Agreement is measured on rows you give it; if they
   do not look like the rows the model will see, the figure does not transfer. Run your own real cases through the pruned model.
 - Pruning a boosted model without a refit fails a regression accuracy bar: the pruned model's values drift from the full one's. Prune random
@@ -154,6 +169,8 @@ forest's on the held-out rows; the labels are synthetic, so it shows that the se
 
 ## Speed: where the speedup shrinks
 
+On a small 2-core Intel Celeron N4020 the unpruned compile gain depends on the library, and xgboost gains least (xgboost-vector 2.7x): xgboost 3.0x and ydf-rf 3.4x with one thread (codegen-block; xgboost-vector 2.7x), against 6.0x for lightgbm and 9.5x for sklearn-rf; the `flat` backend is 2.2x for xgboost. With both cores the ratio against the library at the same thread count stays within 0.6 of the one-thread ratio for xgboost, lightgbm and ydf, because the source library parallelises too (see `bench/README-TABLE-1.2.md`).
+
 - The headline figures (at 10 % of the trees: 18.4x with all cores against all cores, 8 threads, and 24.8x one thread against one thread;
   medians of three runs) are on synthetic data whose label (a few threshold rules plus noise) was chosen so that a 10 % prune passes its
   bar; the same forest size on a denser label did not prune to 10 % at 90 % agreement. Read `bench/README-NUMBERS.md` before quoting them.
@@ -183,9 +200,23 @@ forest's on the held-out rows; the labels are synthetic, so it shows that the se
   the check does not know are not checked). The generated code only compares and adds floats, so the ones that matter are the vector and
   bit-manipulation sets. On the 10 % forest of the benchmark, on an Intel Core i7-8550U (AVX2), `--native` ran 6.8 % SLOWER than the default on one thread (ratio 0.932, 95 % interval 0.926 to 0.948) and 4.5 % slower on all 8 threads (0.955, 0.948 to 0.959), in interleaved rounds of one process;
   the twin of the default build, the noise floor of that method, read 0.996 and 1.001. One forest on one CPU: it is not a rule, and it is not a reason to expect a gain. The answers are bit-identical either way.
-- Link-time optimisation across the chunks of generated code is not used (planned for 1.1): the driver reaches a chunk through a table of function pointers
+- Link-time optimisation does not cross the chunks of generated code, unless the forest is built as ONE crate (`--unit single`, QF 1.1; the default is still `chunks`
+  until the paired measurement is in). One crate costs one big `rustc` process (the RAM of the whole forest at once, so the plan builds chunks instead when it does not
+  fit, with a notice) and its fat LTO is serial: the codegen units only parallelise the work before the LTO merge. What follows describes the `chunks` build. QF 1.1's default build asks for fat LTO, 16 codegen units and an inline threshold of 3000
+  (`--compile-preset 1.1`), but the chunks are then still separate crates joined as objects: the driver reaches a chunk through a table of function pointers
   once per block of rows, so there is no call to inline across chunks, and one crate for the whole forest would give up the bounded memory of
-  separate chunks. Not measured. Neither build shape (`fast`, `top`) has it, so `top` here means one codegen unit everywhere (chunks and driver) and no LTO across chunks, not fat LTO; fat LTO needs the one-crate build (planned for 1.1).
+  separate chunks. In the `chunks` build, fat LTO therefore acts ONLY on the driver's link (where the standard library and the driver meet): `-C lto=fat`
+  on a chunk crate (`--crate-type lib --emit obj`) is a no-op (objects byte-identical with and without it, checked on rustc 1.99), so a chunk is optimised
+  by its own codegen unit and the inline threshold, not by LTO; only `--unit single` gives fat LTO something to merge. What fat LTO gains on generated forest
+  code has not been measured yet (the figures behind the default were taken on a whole pipeline that includes the forest, not on a library loaded from Python).
+  `--compile-preset 1.0` is QF 1.0's build.
+- **Build time and RAM grow with fat LTO and the inline threshold of the 1.1 default build, by amounts not yet measured on generated code.** Fat LTO also
+  optimises the standard library on every link, so even a toy forest builds markedly slower than in QF 1.0's build and the library it leaves is larger (not yet measured, nor the peak memory, on the
+  forest sizes of the compile-cost bullet below, per build: `chunks` and `--unit single`). The memory plan scales its estimate of a `rustc` job by
+  `backend_codegen.peak_factor` (a factor above 1 for the inline threshold of the 1.1 default, and 2.0 more for fat LTO in a `--unit single` build, where it acts) and
+  that of the driver's link, which runs fat LTO in either mode, by `backend_codegen.link_peak_factor`; both are set ABOVE any growth read so far, so the same RAM
+  takes fewer parallel jobs, and a machine with little RAM may be refused (`NotEnoughRam`; `best` then falls back to the flat format with a
+  notice that names `--compile-preset 1.0`) where QF 1.0's build still fitted. The factors per chunk have not been measured yet.
 - **A profile-guided build is only as good as the rows it was profiled on, and the checks on them are about the number of rows and the agreement of the
   rows with themselves, not about speed.** `codegen-pgo` refuses fewer than 2,048 rows and a profile whose two halves (two disjoint halves of the rows,
   profiled apart) agree on less than 82 % of the edge counts (`llvm-profdata overlap`); `best` then builds `codegen-block` with a notice, and the named
@@ -218,18 +249,21 @@ forest's on the held-out rows; the labels are synthetic, so it shows that the se
   is planned for 1.1), rows that do not look like the ones that will be predicted (two halves of the wrong rows agree with each other: the check cannot see
   it), other data and other forests than these three, and x86 (the counts come from the branch structure, not the instruction set, but it was not run there).
 - **The `fast` build shape (opt 3, no LTO, 16 codegen units, profile pass in the same shape) was the best of the shapes compared on a text-feature
-  preparation crate, not on generated forest code.** On that crate (x86-64-v2, a shared laptop, 28 interleaved rounds): a profile taken and used in the fast
+  preparation crate, not on generated forest code. It was QF 1.0's default; QF 1.1's default is fat LTO, 16 codegen units and inline 3000
+  (a later measurement on a separate ARM machine favoured it; its figures have not been re-measured on this build), and this bullet is the record of why 1.0 chose `fast`.** On that crate (x86-64-v2, a shared laptop, 28 interleaved rounds): a profile taken and used in the fast
   shape ran +14.6 % faster than no profile (95 % interval +11.8 to +17.1 %) and +4.0 % faster than a profile taken and used in the slow top-tier shape
-  (fat LTO, one codegen unit; interval +1.0 to +6.2 %, and the run could not resolve differences under about 3 points, so this one is marginal),
+  (fat LTO, one codegen unit, a build QF no longer offers as a default; interval +1.0 to +6.2 %, and the run could not resolve differences under about 3 points, so this one is marginal),
   with 67 % less process time for the profile-guided build; a profile taken in the fast shape and applied to a final build in the slow one matched none
   of the hot functions and ran as fast as no profile. Details and caveats:
-  [bench/README-GENERATED-SHAPE.md](bench/README-GENERATED-SHAPE.md). On the benchmark's 10 % forest (the same CPU, 30 interleaved rounds) the `top` shape ran at 1.003 of the `fast` build's speed on one thread (95 % interval 0.995 to 1.018) and 1.005 on all 8 threads (1.000 to 1.009), the earlier defaults (`opt-level` 2, baseline x86-64, one codegen unit per chunk) at 1.004 and 1.000, and the twin of `fast` at 0.996 and 1.001: no difference beyond the noise of the method; the answers are bit-identical either way.
+  [bench/README-GENERATED-SHAPE.md](bench/README-GENERATED-SHAPE.md). On the benchmark's 10 % forest (the same CPU, 30 interleaved rounds) the `top` shape (one codegen unit, since removed) ran at 1.003 of the `fast` build's speed on one thread (95 % interval 0.995 to 1.018) and 1.005 on all 8 threads (1.000 to 1.009), the earlier defaults (`opt-level` 2, baseline x86-64, one codegen unit per chunk) at 1.004 and 1.000, and the twin of `fast` at 0.996 and 1.001: no difference beyond the noise of the method; the answers are bit-identical either way.
 - The profile-applied check of `codegen-pgo` is about HOT functions only: the fewest functions that together hold 90 % of the profile's counts (in
   practice the generated trees). It fails when the profile has no counts, when a hot generated function is not in the code, or when LLVM reports that a hot
   function lost its profile; LLVM's "no profile data" and hash-mismatch warnings about other, cold functions (an error path, a chunk's entry, a tree the
   profile run did not reach) are counted, never fatal. A profile that matches the hot code but not some cold code is therefore accepted, and that cold
   code runs without the profile's help.
-- The build's memory plan is an estimate: it keeps the `rustc` jobs within 85 % of the RAM that is free, from a model calibrated on small chunks (up
+- The build's memory plan is an estimate (scaled by `peak_factor` and `link_peak_factor` for fat LTO and the inline threshold, see above): it needs a readable
+  free-RAM figure, which it takes from `/proc/meminfo` (Linux) and from a cgroup memory limit; where neither can be read (macOS, Windows) it cannot plan and builds
+  with the jobs and units asked for, saying so (`RAM: ... (available RAM could not be read)`), so pass `--jobs` / `--codegen-units` that fit; it keeps the `rustc` jobs within 85 % of the RAM that is free, from a model calibrated on small chunks (up
   to 69,000 nodes) and set to cover the 850 MB per `rustc` read on 150,000-node chunks of a 4.5-million-node forest; a 150,000-node chunk at 16 units
   has not been measured (`backend_codegen.rustc_peak_estimate_mb`), so it can be too cautious (fewer jobs than the machine could run) or, on a forest shaped unlike
   those, too optimistic; `ram_mb` / `QF_RAM_MB` override it.
@@ -237,6 +271,7 @@ forest's on the held-out rows; the labels are synthetic, so it shows that the se
   the benchmark's size. Measured on an Intel Core i7-8550U with the `fast` shape at `opt-level` 3 (the build plans its `rustc` jobs against the free RAM, so the
   job counts differ and the times are not comparable between rows): `codegen-pgo` on the 208,649-node forest 156 s (3 jobs, 608 MB largest `rustc`), on 507,515 nodes 314 s
   (2 jobs, 833 MB), on 1,015,056 nodes 689 s (1 job, 1003 MB); `codegen-block` on the 1,999,767-node exact forest 432 s (1 job, 1001 MB).
+  These figures are QF 1.0's build (`--compile-preset 1.0`); the 1.1 default takes longer and more memory (not yet measured).
   Memory, not time, is the wall for bigger forests; the generated code is split into chunks to bound it. The `top` shape took 179 s on the
   208,649-node forest (327 MB). On the 880-node test fixture `codegen-block` takes 1.8 s at level 3 against 1.6 s at level 2 (median of 3, shared machine; 148 MB peak either way).
   The `fast` shape builds each chunk's codegen units in parallel: on one 68,682-node chunk of an xgboost forest of depth-10 trees (one run each, a
@@ -265,6 +300,7 @@ forest's on the held-out rows; the labels are synthetic, so it shows that the se
   `const + coef * x` into a multiply-add, and QuickForest's evaluator, like LightGBM on x86, does not. The differential harness allows these rows
   on aarch64 only 1e-12 times the magnitude of their terms (|answer| plus the sum of the leaf terms), so inputs near 1e6 with an answer near zero are judged
   against the size of the numbers that were added, not against a fixed 1e-12; x86-64 keeps the exact bar.
+- Format 7 (vector leaves, 1.2): untested on aarch64 (no arm machine in the 1.2 measurements); the x86-64 differential bar applies.
 - macOS and Windows: untested.
 
 ## Safety
@@ -284,8 +320,13 @@ forest's on the held-out rows; the labels are synthetic, so it shows that the se
 
 ## Roadmap (planned for 1.1, none of it measured or built yet)
 
+After 1.2:
+- A streaming path for vector-leaf xgboost models (today they are pruned in memory, `--memory-mb` raised).
+- `--output-weights` to weight the outputs of a multi-output model in the pruning bar (today every output counts the same).
+- A bake-off of multi-output pruning on real data (1.2 was measured on synthetic data).
+
 - Speed against the number of profile rows: a paired timing on x86 of builds profiled on 100 to 20,000 rows, to set the floor by speed instead of by the agreement of the counts.
 - A memory-lean `check.random_rows`: on a wide forest the random rows of `optimize --verify` hold about 9 times the matrix in temporaries at the cap (it is the peak of the verify step).
 - `PARALLEL_MIN_ROWS` (8,192 rows): measure again on 8 threads.
-- Link-time optimisation across the chunks of generated code (one crate for the whole forest, which gives up the bounded memory of separate chunks).
+- Link-time optimisation across the chunks of generated code (one crate for the whole forest, which gives up the bounded memory of separate chunks); fat LTO inside the driver and each chunk is in 1.1 (above).
 - The embed crate: the evaluator as a Rust library for programs that run a compiled forest without Python.

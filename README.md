@@ -1,6 +1,6 @@
 # QuickForest
 
-QuickForest makes a large tree ensemble (xgboost, LightGBM or YDF) cheap to load and fast to predict with. It has two paths, which you can
+QuickForest makes a large tree ensemble (xgboost, LightGBM, YDF, or a scikit-learn forest) cheap to load and fast to predict with. It has two paths, which you can
 use alone or together, and you choose the size:
 
 - **Compile only, no pruning.** All the trees are kept and compiled to generated Rust code that rustc builds on your machine (or, without rustc,
@@ -88,6 +88,27 @@ For xgboost the compiled answers are identical to the bit (with a base margin, x
 difference is bounded; see the table). For LightGBM they are bounded by the rounding of the leaves to float32 unless you compile with
 `--f64-leaves`. For YDF they differ by YDF's own float32 summation drift unless you compile with `--float32-sums`.
 
+## Multi-output trees (1.2)
+
+Since 1.2 a forest whose trees carry several values per leaf is compiled as it is, one tree walk per row for all outputs: scikit-learn decision
+trees, random forests and extra-trees (regressors and classifiers, one or several outputs), xgboost `multi_strategy=multi_output_tree` models and
+YDF random forests (each tree is one vector tree holding every class's share). A scikit-learn model never goes through a pickle: it is exported to a
+`.qfsk` file of plain arrays and the export is checked against the estimator before anything is written. From Python (`scripts/` on the path):
+
+```python
+import qf_sklearn, optimize
+
+qf_sklearn.export_sklearn(rf, "rf.qfsk", X)  # verified against rf.predict; nothing written on a mismatch
+report = optimize.optimize(
+    rf, "SELECTION.npz", "OUT", keep="25%", compile_=True, verify=True
+)  # an estimator is exported, pruned, compiled, checked
+per_output = forest.split_outputs(forest.predict(x))  # forest = backends.load_artifact(...): one array per output
+```
+
+Measured speedup over the library's own `predict` (compile only, 20,000 rows, median of three runs, Intel(R) Celeron(R) N4020 CPU @ 1.10GHz, 2 threads): xgboost 3.0x one thread, 2.4x with both cores; lightgbm 6.0x one thread, 6.4x with both cores; ydf 6.0x one thread, 6.3x with both cores; ydf-rf 3.4x one thread, 3.6x with both cores; sklearn-rf 9.5x one thread, 16.3x with both cores; xgboost-vector 2.7x one thread, 2.6x with both cores (`compile` with the default codegen-block backend, no pruning; full tables in `bench/README-TABLE-1.2.md`). Where the
+gain shrinks (large K, shallow trees, few rows) is under "Speed" in [LIMITS.md](LIMITS.md#speed-where-the-speedup-shrinks); what is refused is
+under "Refused" there.
+
 ## Requirements and install
 
 There is no installer: the scripts run from the repository folder.
@@ -104,10 +125,27 @@ There is no installer: the scripts run from the repository folder.
   `apt install rustc cargo` where the distribution ships one that new (Ubuntu 26.04 ships 1.93; Ubuntu 22.04 ships 1.75, which cannot build it)).
   The prebuilt library is built for the baseline instruction set because it is shipped to other machines (a `-C target-cpu=native` build of it
   measured no faster on an aarch64 device, see [LIMITS.md](LIMITS.md#speed-where-the-speedup-shrinks)). The generated code of `codegen-block` and `codegen-pgo` is built
-  at `opt-level` 3 in the `fast` shape (no link-time optimisation, 16 codegen units, the profile-guided pass built the same way; `--shape top` builds one codegen unit everywhere and no LTO across chunks) for the portable x86-64-v2 CPU (Intel Nehalem and AMD Bulldozer, 2008-2011, and later; `generic` on arm), so it runs on any CPU of that level. `--native` builds for the
+  at `opt-level` 3 with fat link-time optimisation, 16 codegen units and an inline threshold of 3000 (the `1.1` compile preset; the profile-guided pass is built in exactly the same shape; the settings and the preset that gives QF 1.0's build back are in the table below) for the portable x86-64-v2 CPU (Intel Nehalem and AMD Bulldozer, 2008-2011, and later; `generic` on arm), so it runs on any CPU of that level. `--native` builds for the
   CPU of the machine instead: the build only runs on that CPU type, and it measured no faster than the portable build on our workloads (a library
   built for features another CPU lacks is refused when loaded, in one line). Before it builds, it plans its parallel `rustc` jobs against the RAM that is free and prints
-  `RAM: building with N jobs / M units` (fewer jobs, then fewer units, when memory is short; it never swaps).
+  `RAM: building with N jobs / M units` (fewer jobs, then fewer units, when memory is short; it never swaps). The default build needs more memory and
+  time than QF 1.0's did (fat LTO and the high inline threshold; [LIMITS.md](LIMITS.md); the artifact is larger too): the plan counts on it. The free RAM is read on Linux only (`/proc/meminfo`, cgroup limits); elsewhere the plan cannot lower the jobs.
+
+How generated code is built (`compile` and `optimize --compile`; the same names are `options[...]` of the Python API; flat and wave backends refuse them):
+
+| flag (API option) | values | what it does |
+|---|---|---|
+| `--compile-preset` (`compile_preset`) | `1.1` (default), `1.0` | a whole build: `1.1` is fat LTO, 16 codegen units, inline threshold 3000, profile-guided of the same shape with `--data`; `1.0` is exactly QF 1.0's build (no LTO, 16 codegen units a chunk, rustc's own inlining) |
+| `--lto` (`lto`) | `off`, `fat` | link-time optimisation; follows the preset |
+| `--codegen-units` (`codegen_units`) | whole number >= 1 | rustc codegen units per chunk (default 16, all threads); 1 means one unit everywhere, the driver's link included, and is built only when you pass it; the RAM plan may lower it |
+| `--unit` (`unit`) | `chunks` (default), `single` | how the forest is put together: `chunks` = every chunk its own crate, joined as objects (QF 1.0's way; LTO cannot cross chunks); `single` = the whole forest and the driver ONE crate (the chunks become modules), so fat LTO and the inliner see all of it. One big `rustc` process: it needs the RAM of the whole forest at once and builds chunks instead, with a one-line notice, when that does not fit. `--compile-preset 1.0` and `--shape` are chunks unless `--unit single` is given. Which is faster: not yet measured; the default flips with one constant |
+| `--inline-threshold` (`inline_threshold`) | whole number >= 0, or `default` | LLVM's inline threshold (`-C llvm-args=-inline-threshold=N`); `default` is rustc's own |
+| `--pgo` (`pgo`) | `on`, `off` | `on` = profile-guided build, instrumented and final in the same shape, needs `--data`; `off` = `codegen-block`; not given: on whenever `--data` gives rows |
+| `--cspgo` (`cspgo`) | `on`, `off` | CS-PGO, a second profile pass on the linker route (rust-lld) on top of the profile-guided build; not given: on whenever the build is profile-guided, fat-LTO, chunks, on Linux x86-64 with rustc's rust-lld and profiler runtime (else plain PGO with a notice); `off` = plain PGO; `on` refuses where it cannot be built. Compile takes 2 to 4 times longer; speed within about 1 % of plain PGO at one thread (`bench/README-CSPGO.md`) |
+| `--shape` (`shape`) | `fast` | QF 1.0's build by name (`fast` = `--compile-preset 1.0`); replaces the preset's LTO, units and inline. `top` (one codegen unit) was removed: it is refused with a line that says so |
+
+The result (`info["compile_preset"]`, `lto`, `codegen_units`, `inline_threshold`, `unit` (and `unit_fallback` when a one-crate build fell back to chunks), `pgo`, `build`; the `compile` line and `report.md`) records the build. Build time
+and memory of the 1.1 default: not yet measured.
 
 ```
 sudo apt install python3-venv                   # Debian and Ubuntu ship `venv` as a separate package; skip it where `python3 -m venv` works
@@ -137,7 +175,7 @@ RAM: building with 1 job / 16 units
 model /tmp/quickforest-np322xu9/model.ubj, keep 10%, 7.6 s
 - prune: pruned 1 model(s): nodes 107,274 -> 10,700 (10.03x), bytes 3,845,451 -> 384,369; held-out agreement 96.421 % on 4,889 rows (175 disagree; selection rows 97.652 %, so overfit +1.23 points); 1.9 s
 - disagreeing held-out rows (first 10 of 175): row 96: 0 -> 2; row 115: 0 -> 1; row 149: 1 -> 0; row 334: 0 -> 2; row 443: 1 -> 0; row 508: 0 -> 1; row 650: 0 -> 1; row 652: 1 -> 2; row 715: 1 -> 0; row 729: 1 -> 0
-- compile (codegen-pgo, built for x86-64-v2 CPU, fast shape): 0.54 MB, 30 trees, 10,700 nodes
+- compile (codegen-pgo, built for x86-64-v2 CPU, fat LTO, 16 codegen units, inline 3000): 0.54 MB, 30 trees, 10,700 nodes
 - verify: PASS, data 10,000 rows max err 0.0e+00, decisions differ 0, random 10,000 rows max err 0.0e+00, decisions differ 0, paths 16,005 rows max err 0.0e+00, decisions differ 0
 - speed (8 thread(s), real rows): xgboost 3,855,477 rows/s, compiled 3,452,155 rows/s (0.9x); load 0.001 s, extra RSS 0.0 MB
 Emitted: pruned/ and the compiled artifact
@@ -171,11 +209,13 @@ mkdir -p OUT && python3 scripts/quickforest compile WORKDIR/model.ubj OUT/model.
 ```
 
 The commands, options, backends and file formats are in [docs/REFERENCE.md](docs/REFERENCE.md).
+The standard build (fat LTO, 16 codegen units, inline 3000, PGO on data apart from the timed rows) is in [docs/BUILD-STANDARD.md](docs/BUILD-STANDARD.md).
 
 ## Results
 
 The figures below are from one quiet Intel Core i7-8550U (4 cores with 2 hardware threads each, AVX2), with the build defaults of this release
-(generated code at `opt-level` 3, the `fast` shape, the portable x86-64-v2 CPU, profile-guided with the selection rows), on 2026-10-23.
+(generated code at `opt-level` 3, QF 1.0's `fast` build: no LTO, 16 codegen units, the portable x86-64-v2 CPU, profile-guided with the selection rows), on 2026-10-23.
+They are the 1.0 build's figures: the 1.1 default (`--compile-preset 1.1`) has not been measured, so none of its figures is claimed here.
 
 Every figure below comes from a script in `bench/`; [bench/README-NUMBERS.md](bench/README-NUMBERS.md) has the commands, the machine, the
 caveats and the runs that did not work out. The compiled forest and the source library always get the same number of threads. The headline
@@ -246,7 +286,7 @@ is absent (`wave-avx2` runs the scalar wave engine). macOS and Windows are untes
 - Pruning keeps **decisions**, not values. It suits random forests and classifiers; a boosted regression model pruned without a refit
   fails an accuracy bar (compile it whole instead).
 - Some model features are refused with a one-line reason, never answered wrongly: categorical splits in xgboost and YDF, xgboost dart,
-  several LightGBM objectives, oblique YDF splits.
+  several LightGBM objectives, oblique YDF splits, scikit-learn boosting and bagging models (1.2; the full list is in LIMITS.md).
 - The speedup depends on the model, the batch and the number of cores: the compile-only gains measured on the benchmark machine range from
   1.59x (xgboost, `flat`) to 7.09x (LightGBM, `codegen-block`) on one thread, and from 1.68x (xgboost, `codegen-block`) to 6.28x (YDF boosted trees, `codegen-block`) on 8 threads (the wave engines read lower on 8 threads: 1.35x and 1.36x for xgboost); on 8 threads the `flat` engine is within the run-to-run noise of the library for xgboost (1.05x, 0.86x, 1.14x in the three runs) and a YDF random forest (2.23x, 0.92x, 0.75x in the three runs), which is not a gain
   (the generated code and the other cells stayed above 1x in every run); the per-run ranges are in `bench/README-NUMBERS.md`, section 2.

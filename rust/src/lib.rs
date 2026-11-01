@@ -29,6 +29,16 @@
 //! and `lin_coefs` entries of 16 bytes (u32 feature, u32 zero, f64 coefficient). A linear LEAF is a node with bit 63 set, bits 32..63
 //! zero and bits 0..32 the index of its record: its value is `constant + sum coef * x[feature]` in f64, in table order, or the fallback
 //! when any of those features is NaN (what LightGBM's predictor does); the other leaves keep their f32 value.
+//! Vector leaves (format 7, flag bit 4, never with linear leaves; n_groups >= 2): header 56 u32 vec_leaves (>= 1), 60 u32 n_segments
+//! (0..=n_groups); no margin scale (it is 1). A tree record whose group is 0xFFFF_FFFF is a VECTOR tree: each of its leaves is a node
+//! with bits 32..64 zero and bits 0..32 the index of a row of the vector table, whose `n_groups` values are added to groups 0, 1, ...
+//! in order; rows are numbered in file order (the k-th vector leaf from node 0 upward holds row k, every row used once). Other trees
+//! are scalar trees as in format 5. After the category table: the vector table, `vec_leaves * n_groups` values row major, f32, or f64
+//! with flag bit 5 (which needs bit 0), padded to 8 bytes; then, when n_segments > 0, `n_segments + 1` u32 offsets (0, strictly
+//! increasing, n_groups; padded to 8): output j is columns seg[j]..seg[j+1] of the answer (metadata, it changes no prediction).
+//! A format-7 file may also carry NO vector leaves (flag bit 4 clear, vec_leaves 0, n_segments >= 1, n_groups >= 2): scalar trees plus the
+//! segment table, which names the outputs of a model with one tree per output (K regression columns).
+//! A sigmoid over several groups (per column) is allowed in vector files only.
 
 use std::ffi::{c_char, CStr};
 
@@ -48,6 +58,7 @@ const FORMAT_FIRST_LAYOUT_LAST: u32 = 3;
 const FORMAT_XGB: u32 = 4;
 const FORMAT_DOUBLE: u32 = 5;
 const FORMAT_LINEAR: u32 = 6;
+const FORMAT_VECTOR: u32 = 7;
 /// Bytes 40..48 of the header hold the checksum, which is computed with those eight bytes read as zero.
 const CHECKSUM_AT: usize = 40;
 /// A finite double no real leaf fallback is: the fallback of the record that holds the margin scale (backend_flat.py writes it).
@@ -57,6 +68,13 @@ const FLAG_EXT: u32 = 2;
 const FLAG_LINEAR: u32 = 4;
 /// float32 sums whose base margin is added late, in double (YDF with float32 sums); needs !SUM64
 const FLAG_LATE: u32 = 8;
+/// vector leaves (format 7 and only there)
+const FLAG_VECTOR: u32 = 16;
+/// the vector table holds f64 (needs SUM64)
+const FLAG_VEC64: u32 = 32;
+/// The group of a vector tree's record in the file, and in `Model::trees`.
+const VECTOR_GROUP: u32 = u32::MAX;
+const VEC: usize = usize::MAX;
 const LIN_REC: usize = 24;
 const COEF_REC: usize = 16;
 /// LightGBM's kZeroThreshold as a float32
@@ -90,6 +108,36 @@ mod sys {
             off: i64,
         ) -> *mut c_void;
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
+    }
+}
+
+/// The value type of a vector table: f32 leaves are added as scalar leaves are (`add_leaf`), f64 ones (FLAG_VEC64) as doubles.
+trait VecValue: Copy {
+    fn add_to<A: Acc>(self, a: &mut A);
+}
+
+impl VecValue for f32 {
+    #[inline(always)]
+    fn add_to<A: Acc>(self, a: &mut A) {
+        a.add_leaf(self);
+    }
+}
+
+impl VecValue for f64 {
+    #[inline(always)]
+    fn add_to<A: Acc>(self, a: &mut A) {
+        a.add_f64(self);
+    }
+}
+
+/// Adds a vector leaf (`row.len()` values at `v`) to a row's margins, group by group: one contiguous loop the compiler vectorises.
+///
+/// SAFETY: `v` points at `row.len()` readable values.
+#[inline(always)]
+unsafe fn add_vector<A: Acc, V: VecValue>(row: &mut [A], v: *const V) {
+    let values = std::slice::from_raw_parts(v, row.len());
+    for (a, x) in row.iter_mut().zip(values) {
+        x.add_to(a);
     }
 }
 
@@ -213,6 +261,11 @@ pub struct Model {
     /// byte offsets of the linear-leaf records and of the coefficient table (format 6; 0 otherwise)
     lin_at: usize,
     coef_at: usize,
+    /// byte offset of the vector table and whether it holds f64 (format 7; the end of the file otherwise)
+    vec_at: usize,
+    vec64: bool,
+    /// output segments: `n_segments + 1` offsets, empty for none
+    segments: Vec<u32>,
     /// per fold: `n_groups` base margins
     base: Vec<f32>,
     /// per fold: (first tree, number of trees)
@@ -263,7 +316,7 @@ impl Model {
                 "format {format} is the layout of an earlier version (its checksum left the header out): compile the model again"
             ));
         }
-        let (flags, cat_words) = if (FORMAT_DOUBLE..=FORMAT_LINEAR).contains(&format) {
+        let (flags, cat_words) = if (FORMAT_DOUBLE..=FORMAT_VECTOR).contains(&format) {
             (u32_at(b, 48), u32_at(b, 52) as usize)
         } else {
             (0, 0)
@@ -273,14 +326,27 @@ impl Model {
         } else {
             (0, 0)
         };
+        let (vec_leaves, n_segments) = if format == FORMAT_VECTOR {
+            (u32_at(b, 56) as usize, u32_at(b, 60) as usize)
+        } else {
+            (0, 0)
+        };
         let linear = flags & FLAG_LINEAR != 0;
-        if !(FORMAT_XGB..=FORMAT_LINEAR).contains(&format)
+        let vector = flags & FLAG_VECTOR != 0;
+        let vec64 = flags & FLAG_VEC64 != 0;
+        // a format-7 file without vector leaves that only carries an output segment table (K scalar-tree regression outputs)
+        let scalar_segments =
+            format == FORMAT_VECTOR && !vector && vec_leaves == 0 && n_segments > 0;
+        if !(FORMAT_XGB..=FORMAT_VECTOR).contains(&format)
             || objective > EXP
             || (format == FORMAT_XGB && objective > SOFTMAX)
             || average > MEAN_MARGIN
-            || flags & !(FLAG_SUM64 | FLAG_EXT | FLAG_LINEAR | FLAG_LATE) != 0
+            || flags & !(FLAG_SUM64 | FLAG_EXT | FLAG_LINEAR | FLAG_LATE | FLAG_VECTOR | FLAG_VEC64)
+                != 0
             || (flags & FLAG_EXT == 0 && cat_words != 0)
             || linear != (format == FORMAT_LINEAR)
+            || (vector || scalar_segments) != (format == FORMAT_VECTOR)
+            || (vec64 && (!vector || flags & FLAG_SUM64 == 0))
             || (linear && (flags & FLAG_SUM64 == 0 || lin_leaves == 0))
             || (flags & FLAG_LATE != 0 && flags & FLAG_SUM64 != 0)
         {
@@ -300,7 +366,9 @@ impl Model {
             || n_groups > MAX_GROUPS
             || (objective == SOFTMAX) != (n_groups > 1)
                 && (format == FORMAT_XGB || objective == SOFTMAX)
-            || (objective == SIGMOID && n_groups > 1)
+            || (objective == SIGMOID && n_groups > 1 && !vector)
+            || (vector && (n_groups < 2 || vec_leaves == 0 || n_segments > n_groups))
+            || (scalar_segments && (n_groups < 2 || n_segments > n_groups))
             || n_folds == 0
             || n_trees == 0
             || n_nodes == 0
@@ -323,9 +391,21 @@ impl Model {
             .checked_mul(LIN_REC)
             .and_then(|s| s.checked_add(lin_at))
             .ok_or("sizes overflow")?;
-        let size = lin_coefs
+        // the vector and segment tables of format 7 follow; both are empty in formats 4-6
+        let vec_at = lin_coefs
             .checked_mul(COEF_REC)
             .and_then(|s| s.checked_add(coef_at))
+            .ok_or("sizes overflow")?;
+        let seg_at = vec_leaves
+            .checked_mul(n_groups)
+            .and_then(|s| s.checked_mul(if vec64 { 8 } else { 4 }))
+            .and_then(|s| s.checked_next_multiple_of(8))
+            .and_then(|s| s.checked_add(vec_at))
+            .ok_or("sizes overflow")?;
+        let seg_words = if n_segments == 0 { 0 } else { n_segments + 1 };
+        let size = (seg_words * 4)
+            .next_multiple_of(8)
+            .checked_add(seg_at)
             .ok_or("sizes overflow")?;
         if b.len() != size || !(b.as_ptr() as usize + node_at).is_multiple_of(8) {
             return Err(format!("file is {} bytes, the header says {size}", b.len()));
@@ -356,11 +436,21 @@ impl Model {
         let mut trees: Vec<(usize, usize)> = Vec::with_capacity(n_trees);
         for t in 0..n_trees {
             let at = tree_at + t * TREE_REC;
-            let (root, group) = (u32_at(b, at) as usize, u32_at(b, at + 4) as usize);
-            if group >= n_groups || root >= n_nodes || trees.last().is_some_and(|&(r, _)| root <= r)
-            {
+            let (root, raw) = (u32_at(b, at) as usize, u32_at(b, at + 4));
+            // compared as u32: on a 32-bit target a scalar group of 0xFFFF_FFFF would equal VEC as a usize
+            let bad_group = if raw == VECTOR_GROUP {
+                !vector
+            } else {
+                raw as usize >= n_groups
+            };
+            if bad_group || root >= n_nodes || trees.last().is_some_and(|&(r, _)| root <= r) {
                 return Err(format!("tree {t}: bad root or group"));
             }
+            let group = if raw == VECTOR_GROUP {
+                VEC
+            } else {
+                raw as usize
+            };
             trees.push((root, group));
         }
         if trees[0].0 != 0 {
@@ -369,7 +459,9 @@ impl Model {
         // SAFETY: `node_at` is 8-byte aligned (checked above) and `n_nodes * 8` bytes follow it (size check).
         let nodes: &[u64] =
             unsafe { std::slice::from_raw_parts(b.as_ptr().add(node_at).cast(), n_nodes) };
-        for (t, &(root, _)) in trees.iter().enumerate() {
+        // vector leaves met so far, in file order: the next one must hold this row index
+        let mut next_vec = 0usize;
+        for (t, &(root, group)) in trees.iter().enumerate() {
             let end = trees.get(t + 1).map_or(n_nodes, |&(r, _)| r);
             for (i, &w) in nodes.iter().enumerate().take(end).skip(root) {
                 let right = ((w >> 32) & 0xffff) as usize;
@@ -393,6 +485,11 @@ impl Model {
                     } else if f32::from_bits(w as u32).is_nan() {
                         return Err(format!("tree {t}, node {i}: NaN threshold"));
                     }
+                } else if group == VEC {
+                    if w >> 32 != 0 || (w as u32) as usize != next_vec {
+                        return Err(format!("tree {t}, node {i}: bad vector leaf"));
+                    }
+                    next_vec += 1;
                 } else if linear && w >> 63 == 1 {
                     // a linear leaf: bits 32..63 zero, bits 0..32 the record
                     if (w >> 32) & 0x7fff_ffff != 0 || ((w as u32) as usize) >= lin_leaves {
@@ -432,6 +529,36 @@ impl Model {
                 ));
             }
         }
+        if next_vec != vec_leaves {
+            return Err(format!(
+                "vector table holds {vec_leaves} rows, the trees have {next_vec} vector leaves"
+            ));
+        }
+        let values = vec_leaves * n_groups; // no overflow: the size check above multiplied it
+                                            // SAFETY: the vector table lies inside the file (size check) and starts 8-byte aligned (as `tab`).
+        let bad_value = unsafe {
+            let p = b.as_ptr().add(vec_at);
+            if vec64 {
+                std::slice::from_raw_parts(p.cast::<f64>(), values)
+                    .iter()
+                    .position(|v| !v.is_finite())
+            } else {
+                std::slice::from_raw_parts(p.cast::<f32>(), values)
+                    .iter()
+                    .position(|v| !v.is_finite())
+            }
+        };
+        if let Some(k) = bad_value {
+            return Err(format!("vector leaf {}: not a finite number", k / n_groups));
+        }
+        let segments: Vec<u32> = (0..seg_words).map(|j| u32_at(b, seg_at + 4 * j)).collect();
+        if n_segments > 0
+            && (segments[0] != 0
+                || segments.windows(2).any(|p| p[0] >= p[1])
+                || segments[n_segments] as usize != n_groups)
+        {
+            return Err("output segments out of order".into());
+        }
         Ok(Model {
             storage,
             n_features,
@@ -446,6 +573,9 @@ impl Model {
             cats_at,
             lin_at,
             coef_at,
+            vec_at,
+            vec64,
+            segments,
             base,
             folds,
             trees,
@@ -471,6 +601,10 @@ impl Model {
     fn margin_scale(&self) -> f64 {
         let b = self.storage.bytes();
         let word = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        if self.flags & FLAG_VECTOR != 0 || !self.segments.is_empty() {
+            // format 7 (vector leaves or a segment table) has no margin scale: bytes 56..64 hold the table counts
+            return 1.0;
+        }
         if self.flags & FLAG_LINEAR == 0 {
             let s = f64::from_bits(word(56));
             return if s == 0.0 { 1.0 } else { s };
@@ -566,6 +700,41 @@ impl Model {
         out
     }
 
+    /// Adds one vector tree to a block's margins (`margin`: `g` per row): each row's leaf holds a row index of the vector table, whose
+    /// `g` values go to groups 0..g. The rows `0..full` are walked from `xb`, the `used` tail rows from `pad` (as in `predict_rows`).
+    ///
+    /// SAFETY: as `walk`; `table` is the vector table of a file `from_storage` validated. Every leaf of a vector tree holds an index
+    /// below vec_leaves (L5 counts them in file order, L6 matches the count), so `idx * g .. idx * g + g` lies inside the table (L3).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn vector_tree<A: Acc, V: VecValue, const EXT: bool>(
+        &self,
+        nodes: *const u64,
+        cats: *const u32,
+        root: usize,
+        xb: &[f32],
+        pad: &[f32],
+        (full, used): (usize, usize),
+        margin: &mut [A],
+        table: *const V,
+    ) {
+        let g = self.n_groups;
+        for r in (0..full).step_by(LANES) {
+            let leaves = self.walk::<EXT>(nodes, cats, root, xb, r);
+            for (l, leaf) in leaves.iter().enumerate() {
+                let row = &mut margin[(r + l) * g..(r + l + 1) * g];
+                add_vector(row, table.add((*leaf as u32 as usize) * g));
+            }
+        }
+        if used > 0 {
+            let leaves = self.walk::<EXT>(nodes, cats, root, pad, 0);
+            for (l, leaf) in leaves.iter().take(used).enumerate() {
+                let row = &mut margin[(full + l) * g..(full + l + 1) * g];
+                add_vector(row, table.add((*leaf as u32 as usize) * g));
+            }
+        }
+    }
+
     /// Averaged outputs for the rows `x` (row major, `n_features` f32 each) into `out` (`n_groups` per row).
     fn predict_rows<A: Acc, O: Out, const EXT: bool, const LIN: bool>(
         &self,
@@ -586,6 +755,8 @@ impl Model {
                 coefs: p.add(self.coef_at).cast(),
             }
         };
+        // SAFETY: `vec_at` lies inside the storage or at its end (checked in `from_storage`); with no vector tree it is never read.
+        let vt = unsafe { self.storage.bytes().as_ptr().add(self.vec_at) };
         let mut acc = vec![A::default(); BLOCK * g];
         let mut margin = vec![A::default(); BLOCK * g];
         let mut row = vec![A::default(); g];
@@ -621,6 +792,38 @@ impl Model {
                     }
                 }
                 for &(root, group) in &self.trees[first..first + count] {
+                    if group == VEC {
+                        let m = &mut margin[..rows * g];
+                        // SAFETY: see `vector_tree`; the table type is the one the file declares.
+                        unsafe {
+                            if self.vec64 {
+                                let t = vt.cast::<f64>();
+                                self.vector_tree::<A, f64, EXT>(
+                                    nodes,
+                                    cats,
+                                    root,
+                                    xb,
+                                    &pad,
+                                    (full, used),
+                                    m,
+                                    t,
+                                );
+                            } else {
+                                let t = vt.cast::<f32>();
+                                self.vector_tree::<A, f32, EXT>(
+                                    nodes,
+                                    cats,
+                                    root,
+                                    xb,
+                                    &pad,
+                                    (full, used),
+                                    m,
+                                    t,
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     for r in (0..full).step_by(LANES) {
                         // SAFETY: r + LANES <= full <= rows, so the lanes' rows lie inside `xb`; see `walk`.
                         let leaves = unsafe { self.walk::<EXT>(nodes, cats, root, xb, r) };
@@ -771,7 +974,7 @@ impl Model {
             ENGINE_WALKER => self.predict_with(x, out, bm, threads),
             wave::ENGINE_WAVE | wave::ENGINE_AVX2 => {
                 if self.flags & !FLAG_LATE != 0 {
-                    return Err("the wavefront engines do not run double-sum, extended or linear-leaf (LightGBM / YDF) files; use engine 0".into());
+                    return Err("the wavefront engines do not run double-sum, extended, linear-leaf (LightGBM / YDF) or vector-leaf files; use engine 0".into());
                 }
                 self.predict_wave(x, out, bm, threads, engine);
                 Ok(())
@@ -945,6 +1148,25 @@ pub unsafe extern "C" fn tfl_margin_scale(m: *const Model) -> f64 {
         return 1.0;
     }
     (*m).margin_scale()
+}
+
+/// Output segments: returns n_segments (0: none) and writes min(cap, n_segments + 1) u32 offsets to `out` (nothing when `out` is
+/// null), so a caller with a short buffer learns the count and asks again. 0 for a null handle.
+///
+/// # Safety
+/// `m` comes from `tfl_open`; `out` is null or has room for `cap` u32.
+#[no_mangle]
+pub unsafe extern "C" fn tfl_segments(m: *const Model, out: *mut u32, cap: usize) -> u32 {
+    if m.is_null() {
+        return 0;
+    }
+    let seg = &(*m).segments;
+    if !out.is_null() {
+        for (i, v) in seg.iter().take(cap).enumerate() {
+            *out.add(i) = *v;
+        }
+    }
+    seg.len().saturating_sub(1) as u32
 }
 
 /// Predicts `n_rows` rows (f32, row major) into `out` (`n_rows * n_groups` f32). Returns 0, or 1 on a length problem.
@@ -1703,6 +1925,49 @@ mod tests {
         ("ydf_f32", include_bytes!("../tests/data/ydf_f32.flat")),
     ];
 
+    /// What the damage tests mutate: the fixtures, and two format-7 images (the fuzz bases `flat:vec_f32` and `flat:vec_ext64`): five
+    /// groups summed in float32 over two folds; three groups summed in double with extended nodes, an f64 table, a per-column sigmoid
+    /// and output segments.
+    fn damage_bases() -> Vec<(&'static str, Vec<u8>)> {
+        let mut rng = XorShift(0xF07_F07);
+        let mut forest =
+            |groups: usize, n_folds: usize, ext: bool| -> Vec<Vec<(Option<usize>, T)>> {
+                (0..n_folds)
+                    .map(|_| {
+                        (0..3)
+                            .map(|_| (None, random_tree(&mut rng, 4, groups, ext)))
+                            .collect()
+                    })
+                    .collect()
+            };
+        let vec_f32 = VSpec {
+            groups: 5,
+            objective: SOFTMAX,
+            average: MEAN_OUTPUT,
+            flags: 0,
+            folds: forest(5, 2, false),
+            segments: vec![],
+            extra_rows: 0,
+        };
+        let vec_ext64 = VSpec {
+            groups: 3,
+            objective: SIGMOID,
+            average: MEAN_MARGIN,
+            flags: FLAG_SUM64 | FLAG_EXT | FLAG_VEC64,
+            folds: forest(3, 1, true),
+            segments: vec![0, 1, 3],
+            extra_rows: 0,
+        };
+        FIXTURES
+            .iter()
+            .map(|&(n, b)| (n, b.to_vec()))
+            .chain([
+                ("vec_f32", vector_file(&vec_f32, false).0),
+                ("vec_ext64", vector_file(&vec_ext64, false).0),
+            ])
+            .collect()
+    }
+
     fn refix_checksum(b: &mut [u8]) {
         if b.len() >= HEADER {
             set_checksum(b);
@@ -1816,7 +2081,7 @@ mod tests {
         // original checksum would be a damaged file accepted: the test fails.
         let (mut loaded, mut rejected, mut identical, mut different) =
             (0usize, 0usize, 0usize, 0usize);
-        for (name, base) in FIXTURES {
+        for (name, base) in damage_bases().iter().map(|(n, b)| (*n, &b[..])) {
             let original = Model::from_bytes(base)
                 .unwrap_or_else(|e| panic!("{name} must load unchanged: {e}"));
             let mut rng = XorShift(0x9E37_79B9_7F4A_7C15 ^ base.len() as u64);
@@ -1901,7 +2166,7 @@ mod tests {
     /// flags and the margin scale, which are valid over a range of values).
     #[test]
     fn a_bit_flipped_anywhere_in_the_header_is_refused() {
-        for (name, base) in FIXTURES {
+        for (name, base) in damage_bases().iter().map(|(n, b)| (*n, &b[..])) {
             for byte in 0..HEADER {
                 for bit in 0..8 {
                     let mut b = base.to_vec();
@@ -2127,5 +2392,657 @@ mod tests {
         refused(&linear_image(3), "feature out of range");
         refused(&linear_image(4), "bad linear leaf");
         refused(&linear_image(5), "coefficient range");
+    }
+
+    // ---- format 7: vector leaves
+
+    /// A test tree: a split (`kind` 0 plain, 1 zero-as-missing, 2 categorical over the table's only set: extended files only), or a
+    /// leaf holding one value per group (a vector tree) or one value (a scalar tree).
+    enum T {
+        Split {
+            feature: usize,
+            thr: f32,
+            default_left: bool,
+            kind: u64,
+            left: Box<T>,
+            right: Box<T>,
+        },
+        Leaf(Vec<f64>),
+    }
+
+    const VNF: usize = 5;
+    /// the set of every categorical test node: one word, the categories 0, 2, 3, 7 and 31
+    const VCATS: [u32; 2] = [1, 1 | 1 << 2 | 1 << 3 | 1 << 7 | 1 << 31];
+    const VTHR: [f32; 6] = [0.5, 0.0, -1.0, 2.9, 3.0, 1e-36];
+    const VX: [f32; 16] = [
+        f32::NAN,
+        0.0,
+        -0.0,
+        1e-36,
+        -1e-36,
+        -1.0,
+        0.5,
+        0.49999997,
+        1.0,
+        2.9,
+        3.0,
+        7.0,
+        31.5,
+        1e30,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ];
+
+    /// A random tree of at most `depth` levels whose leaves hold `width` values, each representable as an f32 (so that an f64 table
+    /// and its exploded f32 leaves hold the same numbers).
+    fn random_tree(rng: &mut XorShift, depth: usize, width: usize, ext: bool) -> T {
+        if depth == 0 || rng.below(5) == 0 {
+            return T::Leaf(
+                (0..width)
+                    .map(|_| f64::from(((rng.below(1 << 20) as f64 - 524_288.0) * 1.37e-4) as f32))
+                    .collect(),
+            );
+        }
+        let (feature, thr) = (rng.below(VNF), VTHR[rng.below(VTHR.len())]);
+        let (default_left, kind) = (rng.below(2) == 0, if ext { rng.below(3) } else { 0 });
+        let left = Box::new(random_tree(rng, depth - 1, width, ext));
+        let right = Box::new(random_tree(rng, depth - 1, width, ext));
+        T::Split {
+            feature,
+            thr,
+            default_left,
+            kind: kind as u64,
+            left,
+            right,
+        }
+    }
+
+    fn leaf(v: &[f64]) -> Box<T> {
+        Box::new(T::Leaf(v.to_vec()))
+    }
+
+    /// A forest to write as format 7, or exploded (each vector tree as `groups` scalar trees, groups 0.. in order) as format 5.
+    struct VSpec {
+        groups: usize,
+        objective: u32,
+        average: u32,
+        /// SUM64, EXT, LATE and VEC64 (the writer adds FLAG_VECTOR)
+        flags: u32,
+        /// per fold, its trees: group None for a vector tree
+        folds: Vec<Vec<(Option<usize>, T)>>,
+        segments: Vec<u32>,
+        /// table rows (and their count) beyond the trees' vector leaves: -1 drops the last row, 1 adds a zero row
+        extra_rows: i64,
+    }
+
+    /// Byte offsets of a written test file.
+    struct VLayout {
+        tree_at: usize,
+        node_at: usize,
+        vec_at: usize,
+        seg_at: usize,
+    }
+
+    /// Writes `t` depth first. `scalar`: Some(k) writes leaf value k as an f32 leaf, None a vector leaf holding the next table row.
+    fn put_tree(t: &T, scalar: Option<usize>, nodes: &mut Vec<u64>, rows: &mut Vec<Vec<f64>>) {
+        match t {
+            T::Leaf(v) => match scalar {
+                Some(k) => nodes.push(u64::from((v[k] as f32).to_bits())),
+                None => {
+                    nodes.push(rows.len() as u64);
+                    rows.push(v.clone());
+                }
+            },
+            T::Split {
+                feature,
+                thr,
+                default_left,
+                kind,
+                left,
+                right,
+            } => {
+                let at = nodes.len();
+                nodes.push(0);
+                put_tree(left, scalar, nodes, rows);
+                let distance = (nodes.len() - at) as u64;
+                put_tree(right, scalar, nodes, rows);
+                // a categorical node's threshold bits are its set's offset in the category table: 0
+                let thr = if *kind == 2 {
+                    0
+                } else {
+                    u64::from(thr.to_bits())
+                };
+                nodes[at] = thr
+                    | distance << 32
+                    | (*feature as u64) << 48
+                    | [0u64, 1 << 61, 1 << 62][*kind as usize]
+                    | if *default_left { DEFAULT_LEFT } else { 0 };
+            }
+        }
+    }
+
+    fn pad8(b: &mut Vec<u8>) {
+        while !b.len().is_multiple_of(8) {
+            b.push(0);
+        }
+    }
+
+    fn vector_file(s: &VSpec, explode: bool) -> (Vec<u8>, VLayout) {
+        let g = s.groups;
+        let (mut recs, mut folds, mut nodes, mut rows) = (vec![], vec![], vec![], vec![]);
+        for fold in &s.folds {
+            let first = recs.len();
+            for (group, t) in fold {
+                match (group, explode) {
+                    (Some(c), _) => {
+                        recs.push((nodes.len() as u32, *c as u32));
+                        put_tree(t, Some(0), &mut nodes, &mut rows);
+                    }
+                    (None, false) => {
+                        recs.push((nodes.len() as u32, VECTOR_GROUP));
+                        put_tree(t, None, &mut nodes, &mut rows);
+                    }
+                    (None, true) => {
+                        for c in 0..g {
+                            recs.push((nodes.len() as u32, c as u32));
+                            put_tree(t, Some(c), &mut nodes, &mut rows);
+                        }
+                    }
+                }
+            }
+            folds.push((first as u32, (recs.len() - first) as u32));
+        }
+        match s.extra_rows {
+            -1 => {
+                rows.pop();
+            }
+            n => rows.extend((0..n).map(|_| vec![0.0; g])),
+        }
+        let mut body = Vec::new();
+        for (first, count) in &folds {
+            body.extend(first.to_le_bytes());
+            body.extend(count.to_le_bytes());
+        }
+        for f in 0..folds.len() {
+            for c in 0..g {
+                body.extend(base(f, c).to_le_bytes());
+            }
+        }
+        pad8(&mut body);
+        let tree_at = HEADER + body.len();
+        for (root, group) in &recs {
+            body.extend(root.to_le_bytes());
+            body.extend(group.to_le_bytes());
+        }
+        let node_at = HEADER + body.len();
+        for w in &nodes {
+            body.extend(w.to_le_bytes());
+        }
+        let ext = s.flags & FLAG_EXT != 0;
+        if ext {
+            VCATS.iter().for_each(|w| body.extend(w.to_le_bytes()));
+            pad8(&mut body);
+        }
+        let vec_at = HEADER + body.len();
+        if !explode {
+            for v in rows.iter().flatten() {
+                if s.flags & FLAG_VEC64 != 0 {
+                    body.extend(v.to_le_bytes());
+                } else {
+                    body.extend((*v as f32).to_le_bytes());
+                }
+            }
+            pad8(&mut body);
+        }
+        let seg_at = HEADER + body.len();
+        if !explode {
+            s.segments.iter().for_each(|o| body.extend(o.to_le_bytes()));
+            pad8(&mut body);
+        }
+        let (format, flags) = if explode {
+            (FORMAT_DOUBLE, s.flags & !FLAG_VEC64)
+        } else {
+            (FORMAT_VECTOR, s.flags | FLAG_VECTOR)
+        };
+        let mut file = Vec::new();
+        file.extend(MAGIC);
+        for v in [
+            format,
+            VNF as u32,
+            g as u32,
+            folds.len() as u32,
+            recs.len() as u32,
+            nodes.len() as u32,
+            s.objective,
+            s.average,
+        ] {
+            file.extend(v.to_le_bytes());
+        }
+        file.extend([0u8; 8]); // the checksum, set below
+        let tail = if explode {
+            [0, 0] // a margin scale of 0 (means 1)
+        } else {
+            [rows.len() as u32, s.segments.len().saturating_sub(1) as u32]
+        };
+        for v in [
+            flags,
+            if ext { VCATS.len() as u32 } else { 0 },
+            tail[0],
+            tail[1],
+        ] {
+            file.extend(v.to_le_bytes());
+        }
+        file.extend(&body);
+        set_checksum(&mut file);
+        let at = VLayout {
+            tree_at,
+            node_at,
+            vec_at,
+            seg_at,
+        };
+        (file, at)
+    }
+
+    /// The exploded forest as a model. Format 5 refuses a sigmoid over several groups, so that one is written with the identity and
+    /// given the sigmoid after loading: the scalar walker then runs the same per-column transform.
+    fn exploded_model(s: &VSpec) -> Model {
+        let (mut b, _) = vector_file(s, true);
+        let sigmoid = s.objective == SIGMOID && s.groups > 1;
+        if sigmoid {
+            b[32..36].copy_from_slice(&IDENTITY.to_le_bytes());
+            set_checksum(&mut b);
+        }
+        let mut m = Model::from_bytes(&b).unwrap_or_else(|e| panic!("exploded forest: {e}"));
+        if sigmoid {
+            m.objective = SIGMOID;
+        }
+        m
+    }
+
+    /// Each vector tree must answer bit for bit what its W scalar copies answer (groups 0..W in order, same tree order), on every
+    /// objective, average rule, sum type (float32, float32 with a late margin, double, double with an f64 table), plain and extended
+    /// nodes, one or two folds, a scalar tree among the vector ones, row counts around the lanes and the blocks, threads 1 and 3, with
+    /// and without a base margin, f32 and f64 answers.
+    #[test]
+    fn vector_trees_match_their_exploded_forest() {
+        let mut rng = XorShift(0x5EED_0007_0007);
+        let n_max = 2100;
+        let x: Vec<f32> = (0..n_max * VNF).map(|_| VX[rng.below(VX.len())]).collect();
+        let mut case = 0usize;
+        for objective in [IDENTITY, SIGMOID, SOFTMAX, EXP] {
+            for average in [MEAN_OUTPUT, MEAN_MARGIN] {
+                for sum in [0, FLAG_LATE, FLAG_SUM64, FLAG_SUM64 | FLAG_VEC64] {
+                    for ext in [false, true] {
+                        case += 1;
+                        let g = [2, 3, 5][case % 3];
+                        let folds = (0..1 + case % 2)
+                            .map(|f| {
+                                let mut trees: Vec<(Option<usize>, T)> = (0..3)
+                                    .map(|_| {
+                                        let depth = 1 + rng.below(6);
+                                        (None, random_tree(&mut rng, depth, g, ext))
+                                    })
+                                    .collect();
+                                if case.is_multiple_of(4) {
+                                    trees.insert(
+                                        1,
+                                        (Some((f + 1) % g), random_tree(&mut rng, 3, 1, ext)),
+                                    );
+                                }
+                                trees
+                            })
+                            .collect();
+                        let spec = VSpec {
+                            groups: g,
+                            objective,
+                            average,
+                            flags: sum | if ext { FLAG_EXT } else { 0 },
+                            folds,
+                            segments: vec![],
+                            extra_rows: 0,
+                        };
+                        let vector = Model::from_bytes(&vector_file(&spec, false).0)
+                            .unwrap_or_else(|e| panic!("case {case}: {e}"));
+                        let exploded = exploded_model(&spec);
+                        let bm: Vec<f64> = (0..n_max * g)
+                            .map(|k| 0.37 * (k % 7) as f64 - 1.1)
+                            .collect();
+                        for n in [1, 3, 4, 1023, 1025, 2100] {
+                            let xs = &x[..n * VNF];
+                            for threads in [1, 3] {
+                                for margin in [None, Some(&bm[..n * g])] {
+                                    let what = format!("case {case} (objective {objective}, average {average}, flags {sum}, ext {ext}, groups {g}), rows {n}, threads {threads}, margin {}", margin.is_some());
+                                    let (mut a, mut b) = (vec![0f32; n * g], vec![0f32; n * g]);
+                                    vector
+                                        .predict_engine_with(xs, &mut a, margin, threads, 0)
+                                        .unwrap();
+                                    exploded
+                                        .predict_engine_with(xs, &mut b, margin, threads, 0)
+                                        .unwrap();
+                                    assert!(same_bits_f32(&a, &b), "f32 answers differ: {what}");
+                                    let (mut a, mut b) = (vec![0f64; n * g], vec![0f64; n * g]);
+                                    vector
+                                        .predict_engine_with(xs, &mut a, margin, threads, 0)
+                                        .unwrap();
+                                    exploded
+                                        .predict_engine_with(xs, &mut b, margin, threads, 0)
+                                        .unwrap();
+                                    assert!(same_bits_f64(&a, &b), "f64 answers differ: {what}");
+                                }
+                            }
+                        }
+                        for engine in [1, 2] {
+                            let msg = vector
+                                .predict_engine_with(&x[..VNF], &mut vec![0f32; g], None, 1, engine)
+                                .unwrap_err();
+                            assert!(msg.contains("vector-leaf"), "engine {engine}: {msg}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An f64 table's values join a double sum unrounded (base margin first, then the trees in order).
+    #[test]
+    fn an_f64_vector_table_is_summed_in_double() {
+        let spec = VSpec {
+            groups: 2,
+            objective: IDENTITY,
+            average: MEAN_OUTPUT,
+            flags: FLAG_SUM64 | FLAG_VEC64,
+            folds: vec![vec![
+                (None, T::Leaf(vec![0.1, 1e-300])),
+                (None, T::Leaf(vec![0.2, -3.000000000001])),
+            ]],
+            segments: vec![],
+            extra_rows: 0,
+        };
+        let model = Model::from_bytes(&vector_file(&spec, false).0).unwrap();
+        let want = [
+            f64::from(base(0, 0)) + 0.1 + 0.2,
+            f64::from(base(0, 1)) + 1e-300 + -3.000000000001,
+        ];
+        assert_ne!(
+            want[0],
+            f64::from(base(0, 0)) + f64::from(0.1f32) + f64::from(0.2f32)
+        );
+        let mut out = vec![0f64; 6];
+        model
+            .predict_engine_with(&[0.0; 3 * VNF], &mut out, None, 1, 0)
+            .unwrap();
+        assert_eq!(out, [want[0], want[1], want[0], want[1], want[0], want[1]]);
+        let mut out = vec![0f32; 2];
+        model
+            .predict_engine_with(&[0.0; VNF], &mut out, None, 1, 0)
+            .unwrap();
+        assert_eq!(out, [want[0] as f32, want[1] as f32]);
+    }
+
+    /// Two vector trees of one split each over three groups: rows 0, 1 (tree 0) and 2, 3 (tree 1); segments [0, 1, 3].
+    fn small_spec() -> VSpec {
+        let split = |l: &[f64], r: &[f64]| T::Split {
+            feature: 0,
+            thr: 0.5,
+            default_left: true,
+            kind: 0,
+            left: leaf(l),
+            right: leaf(r),
+        };
+        VSpec {
+            groups: 3,
+            objective: IDENTITY,
+            average: MEAN_OUTPUT,
+            flags: 0,
+            folds: vec![vec![
+                (None, split(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0])),
+                (None, split(&[-1.0, -2.0, -3.0], &[0.5, 0.25, 0.125])),
+            ]],
+            segments: vec![0, 1, 3],
+            extra_rows: 0,
+        }
+    }
+
+    /// L1-L8 of the format-7 loader, each one step past its bound with the checksum repaired, so that only that rule can refuse the file.
+    #[test]
+    fn rejects_a_malformed_vector_file() {
+        let s = small_spec();
+        let (good, at) = vector_file(&s, false);
+        let model = Model::from_bytes(&good).unwrap();
+        let mut out = vec![0f32; 6];
+        model
+            .predict_engine_with(
+                &[0.0, 0., 0., 0., 0., 1.0, 0., 0., 0., 0.],
+                &mut out,
+                None,
+                1,
+                0,
+            )
+            .unwrap();
+        let (b0, b1, b2) = (base(0, 0), base(0, 1), base(0, 2));
+        let want = [
+            b0 + 1.0 + -1.0,
+            b1 + 2.0 + -2.0,
+            b2 + 3.0 + -3.0,
+            b0 + 4.0 + 0.5,
+            b1 + 5.0 + 0.25,
+            b2 + 6.0 + 0.125,
+        ];
+        assert_eq!(out, want);
+        let (five, five_at) = vector_file(&s, true);
+        Model::from_bytes(&five).unwrap();
+        let put = |file: &[u8], at: usize, v: &[u8]| {
+            let mut b = file.to_vec();
+            b[at..at + v.len()].copy_from_slice(v);
+            set_checksum(&mut b);
+            b
+        };
+        let p32 = |at: usize, v: u32| put(&good, at, &v.to_le_bytes());
+        let p64 = |at: usize, v: u64| put(&good, at, &v.to_le_bytes());
+        let refused = |b: &[u8], rule: &str| {
+            let msg = Model::from_bytes(b)
+                .err()
+                .unwrap_or_else(|| panic!("a file that breaks `{rule}` was accepted"));
+            assert!(msg.contains(rule), "{rule}: {msg}");
+        };
+        // L1: FLAG_VECTOR <=> format 7, VEC64 needs VECTOR and SUM64, no LINEAR in format 7, no unknown bit, no format 8
+        let newer = "file written by a newer version?";
+        refused(&p32(48, 0), newer);
+        refused(&p32(48, FLAG_VECTOR | 64), newer);
+        refused(&p32(48, FLAG_VECTOR | FLAG_VEC64), newer);
+        refused(&p32(48, FLAG_VECTOR | FLAG_LINEAR | FLAG_SUM64), newer);
+        refused(&p32(8, 8), newer);
+        refused(&put(&five, 48, &FLAG_VECTOR.to_le_bytes()), newer);
+        refused(
+            &put(&five, 48, &(FLAG_SUM64 | FLAG_VEC64).to_le_bytes()),
+            newer,
+        );
+        // L2: at least 2 groups, at least one table row, at most n_groups segments; a sigmoid over several groups only in format 7
+        let counts = "counts out of range";
+        refused(&p32(16, 1), counts);
+        refused(&p32(56, 0), counts);
+        refused(&p32(60, 4), counts);
+        refused(&put(&five, 32, &SIGMOID.to_le_bytes()), counts);
+        Model::from_bytes(&p32(32, SIGMOID)).unwrap();
+        let mut all = small_spec();
+        all.segments = vec![0, 1, 2, 3];
+        Model::from_bytes(&vector_file(&all, false).0).unwrap();
+        // L3: the table and segment sizes follow their counts and the table type
+        let size = "the header says";
+        refused(&p32(56, 5), size);
+        refused(&p32(56, u32::MAX), size);
+        refused(&p32(60, 1), size);
+        refused(&p32(60, 0), size);
+        refused(&p32(48, FLAG_VECTOR | FLAG_SUM64 | FLAG_VEC64), size);
+        // L4: the vector group in format 7 only, any other group below n_groups
+        let group = "bad root or group";
+        refused(&p32(at.tree_at + 4, 3), group);
+        refused(&p32(at.tree_at + 4, VECTOR_GROUP - 1), group);
+        refused(
+            &put(&five, five_at.tree_at + 4, &VECTOR_GROUP.to_le_bytes()),
+            group,
+        );
+        // L5: leaves hold the rows in file order, with nothing in bits 32..64
+        let bad_leaf = "bad vector leaf";
+        refused(&p64(at.node_at + 8, 1), bad_leaf);
+        refused(&p64(at.node_at + 5 * 8, 4), bad_leaf);
+        refused(&p64(at.node_at + 8, 1 << 48), bad_leaf);
+        refused(&p64(at.node_at + 8, 1 << 63), bad_leaf);
+        refused(&p64(at.node_at + 4 * 8, 3), bad_leaf);
+        // L6: as many table rows as vector leaves
+        for extra in [-1, 1] {
+            let mut t = small_spec();
+            t.extra_rows = extra;
+            refused(&vector_file(&t, false).0, "vector table holds");
+        }
+        // L7: finite values, in an f32 and an f64 table
+        refused(
+            &p32(at.vec_at, f32::NAN.to_bits()),
+            "vector leaf 0: not a finite number",
+        );
+        refused(
+            &p32(at.vec_at + 4 * 11, f32::INFINITY.to_bits()),
+            "vector leaf 3: not a finite number",
+        );
+        let mut s64 = small_spec();
+        s64.flags = FLAG_SUM64 | FLAG_VEC64;
+        let (good64, at64) = vector_file(&s64, false);
+        Model::from_bytes(&good64).unwrap();
+        refused(
+            &put(
+                &good64,
+                at64.vec_at + 8 * 11,
+                &f64::NEG_INFINITY.to_le_bytes(),
+            ),
+            "vector leaf 3: not a finite number",
+        );
+        // L8: offsets 0, strictly increasing, n_groups
+        let order = "output segments out of order";
+        refused(&p32(at.seg_at, 1), order);
+        refused(&p32(at.seg_at + 4, 0), order);
+        refused(&p32(at.seg_at + 4, 3), order);
+        refused(&p32(at.seg_at + 8, 2), order);
+        refused(&p32(at.seg_at + 8, 4), order);
+    }
+
+    /// With several groups the sigmoid is the one-group sigmoid of each column, at the edges of xgboost's clamp too.
+    #[test]
+    fn sigmoid_over_several_groups_is_the_one_group_sigmoid_per_column() {
+        let edge = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            88.7,
+            -88.7,
+            -88.70001,
+            100.0,
+            -100.0,
+            1e-30,
+            3.5,
+            -17.25,
+        ];
+        for g in 2..=4 {
+            for start in 0..edge.len() {
+                let m: Vec<f32> = (0..g).map(|k| edge[(start + 5 * k) % edge.len()]).collect();
+                let mut many = m.clone();
+                f32::transform(SIGMOID, &mut many);
+                let wide: Vec<f64> = m.iter().map(|&v| f64::from(v) * 1.25).collect();
+                let mut many64 = wide.clone();
+                f64::transform(SIGMOID, &mut many64);
+                for k in 0..g {
+                    let mut one = [m[k]];
+                    f32::transform(SIGMOID, &mut one);
+                    assert!(
+                        same_f32(many[k], one[0]) && same_f32(one[0], xgboost_sigmoid(m[k])),
+                        "{m:?}[{k}]"
+                    );
+                    let mut one = [wide[k]];
+                    f64::transform(SIGMOID, &mut one);
+                    let want = 1.0 / (1.0 + (-wide[k]).exp());
+                    assert!(
+                        same_bits_f64(&[many64[k]], &one) && same_bits_f64(&one, &[want]),
+                        "{wide:?}[{k}]"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `tfl_segments` returns the count and copies at most `cap` offsets; no segments, no handle: 0. A format-7 file has no margin scale.
+    #[test]
+    fn segments_are_counted_and_copied_up_to_the_buffer() {
+        let (good, _) = vector_file(&small_spec(), false);
+        let m = Box::into_raw(Box::new(Model::from_bytes(&good).unwrap()));
+        let none = {
+            let mut s = small_spec();
+            s.segments.clear();
+            Box::into_raw(Box::new(
+                Model::from_bytes(&vector_file(&s, false).0).unwrap(),
+            ))
+        };
+        // SAFETY: the handles come from Box::into_raw and the buffers hold 8 u32.
+        unsafe {
+            for cap in 0..8 {
+                let mut buf = [u32::MAX; 8];
+                assert_eq!(tfl_segments(m, buf.as_mut_ptr(), cap), 2);
+                for (i, v) in buf.iter().enumerate() {
+                    let want = if i < cap.min(3) {
+                        [0, 1, 3][i]
+                    } else {
+                        u32::MAX
+                    };
+                    assert_eq!(*v, want, "cap {cap}, offset {i}");
+                }
+                let mut buf = [u32::MAX; 8];
+                assert_eq!(tfl_segments(none, buf.as_mut_ptr(), cap), 0);
+                assert_eq!(buf, [u32::MAX; 8]);
+            }
+            assert_eq!(tfl_segments(m, std::ptr::null_mut(), 8), 2);
+            let mut buf = [u32::MAX; 4];
+            assert_eq!(tfl_segments(std::ptr::null(), buf.as_mut_ptr(), 4), 0);
+            assert_eq!(buf, [u32::MAX; 4]);
+            assert_eq!(tfl_margin_scale(m), 1.0);
+            tfl_close(m);
+            tfl_close(none);
+        }
+    }
+
+    /// A format-7 file without vector leaves carries only the output segment table of a one-tree-per-output model (K scalar regression
+    /// columns); every other shape of a format-7 file without the vector flag is refused.
+    #[test]
+    fn scalar_trees_with_a_segment_table() {
+        let (five, _) = vector_file(&small_spec(), true);
+        let make = |segs: &[u32], vec_leaves: u32, objective: u32| {
+            let mut b = five.clone();
+            b[8..12].copy_from_slice(&FORMAT_VECTOR.to_le_bytes());
+            b[32..36].copy_from_slice(&objective.to_le_bytes());
+            b[56..60].copy_from_slice(&vec_leaves.to_le_bytes());
+            b[60..64].copy_from_slice(&(segs.len().saturating_sub(1) as u32).to_le_bytes());
+            let table: Vec<u8> = segs.iter().flat_map(|v| v.to_le_bytes()).collect();
+            b.extend(&table);
+            b.resize(b.len() + table.len().next_multiple_of(8) - table.len(), 0);
+            set_checksum(&mut b);
+            b
+        };
+        let ok = Model::from_bytes(&make(&[0, 1, 2, 3], 0, IDENTITY)).unwrap();
+        assert_eq!(ok.segments, vec![0, 1, 2, 3]);
+        let m = Box::into_raw(Box::new(ok));
+        // SAFETY: the handle comes from Box::into_raw and the buffer holds 8 u32.
+        unsafe {
+            let mut buf = [u32::MAX; 8];
+            assert_eq!(tfl_segments(m, buf.as_mut_ptr(), 8), 3);
+            assert_eq!(&buf[..4], &[0, 1, 2, 3]);
+            assert_eq!(tfl_margin_scale(m), 1.0); // bytes 56..64 hold counts here, not a scale
+            tfl_close(m);
+        }
+        let err = |b: Vec<u8>| Model::from_bytes(&b).err().expect("accepted");
+        assert!(err(make(&[], 0, IDENTITY)).contains("newer version"));
+        assert!(err(make(&[0, 1, 2, 3], 1, IDENTITY)).contains("newer version"));
+        assert!(err(make(&[0, 1, 2, 3, 4], 0, IDENTITY)).contains("counts out of range"));
+        assert!(err(make(&[0, 1, 2, 3], 0, SIGMOID)).contains("counts out of range"));
+        assert!(err(make(&[0, 2, 2, 3], 0, IDENTITY)).contains("output segments out of order"));
+        assert!(err(make(&[0, 1, 2], 0, IDENTITY)).contains("output segments out of order"));
     }
 }

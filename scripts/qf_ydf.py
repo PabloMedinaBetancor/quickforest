@@ -6,7 +6,8 @@ Matrix columns are the model's input features in `model.input_feature_names()` o
 YDF's numerical condition is `value >= threshold` -> positive child; here positive = right, so `x < threshold` goes left, exact in
 float32; a NaN follows the condition's own stored `missing` answer (YDF's na_value, which it set at training from the global imputation).
 Random forests: regression = mean of the leaves; classification = the share of trees voting for each class (winner_takes_all) or the
-mean of the leaf probabilities, so each YDF tree becomes one forest tree per output group (a binary model has one group: class 1).
+mean of the leaf probabilities, so each YDF tree becomes one vector tree holding every class's share (a binary model has one group, class 1,
+and scalar trees).
 Gradient boosted trees: initial prediction + sum of the leaves, then sigmoid / softmax (binomial / multinomial log-likelihood) or
 identity (squared error, absolute error) or exp (poisson).
 
@@ -15,6 +16,7 @@ uplift / survival / anomaly tasks, other GBT losses."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +34,9 @@ LOSS_KIND = {
 
 
 YDF_SMALL_TREE_LEAVES = 64  # YDF's small-tree engine takes trees of at most 64 leaves
+# bench-only (the bench's --replicate-outputs sets QF_REPLICATE_OUTPUTS=1): a multi-class random forest as one scalar tree per class and tree,
+# the 1.1 layout, to measure the vector trees against it on the same model
+REPLICATE_CLASSES = os.environ.get("QF_REPLICATE_OUTPUTS") == "1"
 
 
 def ydf():
@@ -96,9 +101,14 @@ class YdfSource:
         self.classification = classification
         # structure of every YDF tree once, then one forest tree per output group (RF classification) or one in all (the rest)
         self.shapes = [self._shape(t.root, col) for t in raw]
+        self.vector = self.rf and classification and groups >= 2 and not REPLICATE_CLASSES
         irs, tree_info, unit_of = [], [], []
         for u, (arrs, leaves) in enumerate(self.shapes):
-            if self.rf and classification:
+            if self.vector:
+                irs.append(self._ir_vector(arrs, np.stack([self._rf_leaf(leaves, g, n_ydf) for g in range(groups)], 1)))
+                tree_info.append(0)
+                unit_of.append(u)
+            elif self.rf and classification:
                 for g in range(groups):
                     irs.append(self._ir(arrs, self._rf_leaf(leaves, g, n_ydf)))
                     tree_info.append(g)
@@ -118,6 +128,7 @@ class YdfSource:
             [len(t.left) for t in irs],
             self.rf,
             "classification" if classification else "regression",
+            groups if self.vector else 0,
         )
         self.n_ydf = n_ydf
         if gbt and kind == "exp":
@@ -200,6 +211,23 @@ class YdfSource:
         value = np.where(arrs["left"] == -1, leaf64, arrs["thr"]).astype(np.float32)
         return qf.Tree(0, arrs["left"], arrs["right"], arrs["feature"], value, arrs["dl"], leaf64=leaf64)
 
+    @staticmethod
+    def _ir_vector(arrs, table):
+        """A vector tree: the leaf row of every class share (`table`, (nodes, classes) float64, ignored at internal nodes)."""
+        leaf = arrs["left"] == -1
+        vector64 = np.where(leaf[:, None], table, 0.0)
+        value = np.where(leaf, np.float32(0), arrs["thr"]).astype(np.float32)
+        return qf.Tree(
+            qf.VECTOR_GROUP,
+            arrs["left"],
+            arrs["right"],
+            arrs["feature"],
+            value,
+            arrs["dl"],
+            vector=vector64.astype(np.float32),
+            vector64=vector64,
+        )
+
     # ---- the Source interface
     @property
     def size_bytes(self) -> int:
@@ -213,7 +241,10 @@ class YdfSource:
         base is zero."""
         trees = []
         for t, g in zip(self.irs, self.spec.tree_info, strict=True):
-            trees.append(qf.Tree(int(g), t.left, t.right, t.feature, t.value, t.default_left, leaf64=t.leaf64))
+            if t.vector is not None:
+                trees.append(qf.Tree(t.group, t.left, t.right, t.feature, t.value, t.default_left, vector=t.vector, vector64=t.vector64))
+            else:
+                trees.append(qf.Tree(int(g), t.left, t.right, t.feature, t.value, t.default_left, leaf64=t.leaf64))
         base = self.spec.base
         if float32_sums and self.gbt and self.generic_engine:
             for g, b in enumerate(np.asarray(base, np.float32)):
@@ -237,7 +268,24 @@ class YdfSource:
         """True when YDF would run this model with its generic engine (a tree of more than 64 leaves), not its small-tree one."""
         return any(int((t.left == -1).sum()) > YDF_SMALL_TREE_LEAVES for t in self.irs)
 
+    def leaf_codes(self, x) -> np.ndarray:
+        """(trees, rows) int32: the ordinal of the leaf each row ends in, among the leaves of its tree in node order (the row of `leaf_vectors()[i]`)."""
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        qf.check_width(x, self.spec.n_features, self.name)
+        out = np.empty((len(self.irs), len(x)), np.int32)
+        for i, t in enumerate(self.irs):
+            out[i] = qf.leaf_ordinal(t.left)[qf.leaf_positions(t, x)]
+        return out
+
+    def leaf_vectors(self) -> list[np.ndarray]:
+        """Per tree, the (leaves, classes) float32 table the codes of `leaf_codes` index: a leaf's class shares, already divided by the trees."""
+        if not self.vector:
+            raise ValueError(f"{self.name}: only a multi-class random forest has vector trees; use leaf_matrix")
+        return [t.vector[t.left == -1] for t in self.irs]
+
     def leaf_matrix(self, x) -> np.ndarray:
+        if self.vector:
+            raise ValueError(f"{self.name}: a multi-class random forest has vector trees; use leaf_codes and leaf_vectors")
         x = np.ascontiguousarray(x, dtype=np.float32)
         qf.check_width(x, self.spec.n_features, self.name)
         out = np.empty((len(self.irs), len(x)), np.float32)

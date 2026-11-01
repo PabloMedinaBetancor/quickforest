@@ -56,9 +56,22 @@ Every command ends in one of four codes, and a refusal is one line on stderr, ne
 
 | format | read | supported | refused with a one-line reason | pruned copy |
 |---|---|---|---|---|
-| xgboost `.ubj` / `.json` | `XgbSource` | gbtree and random-forest boosters; binary:logistic, reg:logistic, multi:softprob, reg:squarederror | categorical splits, vector leaves, dart, other objectives | same format |
+| xgboost `.ubj` / `.json` | `XgbSource` | gbtree and random-forest boosters; binary:logistic, reg:logistic, multi:softprob, reg:squarederror; vector leaves (`multi_strategy=multi_output_tree`, 1.2) | categorical splits, dart, other objectives; `num_target >= 2` with `num_class >= 2`, reduced-gradient vector trees | same format |
 | LightGBM text model | `qf_lgb.LgbSource` | gbdt, dart, goss, rf; regression family, binary (`sigmoid:s`), multiclass, cross_entropy, poisson, gamma, tweedie, ranking; numerical splits with every missing type, `zero_as_missing`, categorical splits; `average_output`; linear trees (`linear_tree=true`), compile only | multiclassova, cross_entropy_lambda, regression sqrt, custom objectives | LightGBM text with the kept trees in iteration order; never for linear trees |
 | YDF model folder | `qf_ydf.YdfSource` (imports `ydf`) | random forest (winner-take-all or averaged probabilities) and gradient-boosted trees; regression, binary, multiclass; squared and absolute error, binomial, multinomial, poisson | categorical, boolean, discretised or oblique features or conditions; ranking, uplift, survival, anomaly detection; other losses; boosted trees saved with `apply_link_function=False` | YDF folder (`remove_tree`) |
+
+### Multi-output models (1.2)
+
+| source | how it reaches QuickForest | outputs | refused |
+|---|---|---|---|
+| scikit-learn `DecisionTree` / `RandomForest` / `ExtraTrees`, regressor or classifier, 1.3 or newer | `qf_sklearn.export_sklearn(est, "m.qfsk", X=None)` writes a `.qfsk` (plain numpy arrays in an `.npz`, loaded with `allow_pickle=False`); every command reads the `.qfsk`; `prune`, `optimize` and `check` also take the fitted estimator itself as `model` (exported into the output folder first) | regressor: K columns, the mean of the trees' leaf values; classifier: all outputs side by side, the mean of the leaf class shares, `segments` marks where each output's classes start; a binary output keeps both columns (scikit-learn's `predict_proba` layout) | GradientBoosting, HistGradientBoosting, Bagging, pickle/joblib files, scikit-learn < 1.3 |
+| xgboost `multi_strategy=multi_output_tree` | `.ubj` / `.json`, as any xgboost model | `num_target` columns (regression) or `num_class` (softprob); one vector tree feeds every column | `num_target >= 2` with `num_class >= 2`; reduced gradient |
+| YDF random forest (classification, 2+ classes) | model folder, as any YDF model | each tree is one vector tree holding every class's share (1.1 compiled one scalar tree per class); a binary model stays one group (class 1) | as before |
+
+The export is verified: QuickForest's own walk of the exported arrays must reproduce the estimator's `predict` / `predict_proba` to 1e-9 relative on your `X`
+(when given) plus 2,048 rows built from the trees' thresholds and NaN, or nothing is written. scikit-learn sends a sample left when `x <= threshold`; the
+forest uses `x < up32(floor32(t))` as the LightGBM reader does. A pruned `.qfsk` is a real model again with `qf_sklearn.subforest(estimator, kept)` (a deep copy
+holding only `estimators_[i]` for `i` in `kept`, the `kept_indices` of the report).
 
 The backing tests are `tests/test_readers.py` (readers and refusals), `tests/test_extensions.py` and `tests/test_robust.py`.
 
@@ -107,7 +120,7 @@ are always different rows. The choice of trees is judged on the rows you give it
 ```
 python3 scripts/quickforest optimize MODEL --data SELECTION.npz --keep 10% --compile --verify [--out DIR]
     [--decision argmax|threshold:T|rule.py[:func]] [--min-agreement 95] [--backend best|flat|...|auto] [--method greedy|orientation]
-    [--native | --target-cpu x86-64-v3|...] [--shape fast|top]
+    [--native | --target-cpu x86-64-v3|...] [--compile-preset 1.1|1.0] [--lto off|fat] [--codegen-units N] [--inline-threshold N|default] [--unit single|chunks] [--pgo on|off] [--cspgo on|off] [--shape fast]
     [--f64-leaves] [--float32-sums] [--regression log|raw] [--keep-ladder 5%,10%,25%,50%] [--accept-any]
 ```
 
@@ -170,7 +183,7 @@ Examples: `--keep 50%` (half), `--keep 10` (ten per class), `--keep auto --min-a
 
 Bars 1 and 4 are checks the tools make and enforce; bars 2 and 3 are things for you to judge, which no command checks.
 
-1. **Held-out agreement.** The pruned forest's decisions agree with the full forest's on at least `--min-agreement` percent of the held-out
+1. **Held-out agreement.** (K > 1 outputs: one decision per output, `argmax` inside each classifier output's block and `p >= 0.5` for a width-1 output; every output must reach the bar. `threshold:T` is for one output only; a rule file returns shape `(..., K)`.) The pruned forest's decisions agree with the full forest's on at least `--min-agreement` percent of the held-out
    rows (default 95). "Decision" is `--decision`: `argmax` (default; 0.5 for a single output), `threshold:T` (a finite number), or a Python file
    `rule.py[:func]` with `func(p) -> ints` for cascades with thresholds or abstentions (the file is executed: trusted input only). The rule gets `p`, an array of float32 outputs whose LAST axis is the output groups (`p[..., 0]` is the one output of a single-output model, `p.argmax(-1)` the class) and whose leading axes are rows, or candidate trees x rows during the greedy selection; it returns one integer or bool per leading position, shape `p.shape[:-1]`. Mark an abstention with an integer code such as -1, never NaN (`NaN == NaN` is False). The rule is tried once on a (3, 5, groups) and a (5, groups) array when it is loaded, and every answer is checked; one that raises, returns another shape or returns floats ends the run with one line. Set the
    bar from what your use can accept. Selection overfits by about a point, so the held-out figure is the honest one.
@@ -262,7 +275,7 @@ report = prune.run("forest.ubj", "SELECTION.npz", "PRUNED", keep="25%")
 ```
 
 - `optimize.optimize(model, data, out, keep="10%", compile_=False, verify=False, *, decision="argmax", method="greedy", min_agreement=95.0,
-  backend="best", average="output", target_cpu=None, shape=None, seed=15, sub=1.0, threads=None, regression=None, f64_leaves=False,
+  backend="best", average="output", target_cpu=None, shape=None, compile_preset=None, lto=None, codegen_units=None, inline_threshold=None, unit=None, pgo=None, seed=15, sub=1.0, threads=None, regression=None, f64_leaves=False,
   float32_sums=False, keep_ladder=None, accept_any=False)` runs the pipeline of `optimize`, writes `out`, and returns the report dict (`ok`, `failures`, `stages`, `kept_indices`,
   `seconds`, ...). Unlike the command it does not call `sys.exit`: read `report["ok"]` (the command's exit 2) and
   `report["compile_unsupported"]` (its exit 3). An argument that cannot be used raises `ValueError` or `SystemExit` with one line.
@@ -275,8 +288,17 @@ report = prune.run("forest.ubj", "SELECTION.npz", "PRUNED", keep="25%")
   rounding rule of [the `--keep` section](#--keep-the-size-you-choose). `regression` is `qf_common.RegBar(space, median_pct, max_pct,
   error_slack)` with `space` `"log"` or `"raw"` (the flags `--regression`, `--med-tol`, `--max-tol`, `--error-slack`).
 - A compiled forest is used with `evaluator.FlatForest` ([below](#using-a-compiled-forest-from-python)).
+- `model` may also be a fitted scikit-learn estimator (`optimize.optimize`, `prune.run`, `check`): it is exported to a verified `.qfsk` in the output folder first and
+  the estimator's own answer is then part of the equality check. `qf_sklearn.export_sklearn(est, path, X=None)` is the export alone; `qf_sklearn.subforest(est, kept)` turns
+  `kept_indices` back into a scikit-learn object.
+- A model of K > 1 outputs: `forest.n_outputs` (K), `forest.segments` (the offsets `[0, c_1, c_1 + c_2, ..., groups]` of each output's columns, or `None`),
+  `forest.split_outputs(p)` (a list of K arrays: a classifier's `predict_proba` blocks, a regressor's columns) and `forest.argmax_outputs(p)` (`(rows, K)` integers, classifiers only;
+  `evaluator.split_outputs` / `evaluator.argmax_outputs` take the same facts as arguments).
 
 ## Regression models
+
+With K > 1 outputs the regression bar is applied to every output on its own column (the selection minimises the squared difference summed over the columns); every output must pass. `--regression` omitted on a regression model is not an error: the run
+judges it by the classifier rule (`p >= 0.5` or argmax decisions), a figure that means nothing for a regression, so always pass `--regression log|raw` for one.
 
 `--regression log|raw` (`optimize` and `prune`) replaces the class-agreement bar: the model outputs the log of a positive
 quantity (`log`: relative difference = `|exp(pruned - full) - 1|`) or the quantity itself (`raw`). The bars on the held-out rows are: the median
@@ -290,7 +312,8 @@ Boosted models lose accuracy when pruned without refitting, and these bars fail 
 
 ```
 python3 scripts/quickforest compile MODEL OUT [--backend NAME] [--average output|margin] [--data SELECTION.npz]
-    [--native | --target-cpu x86-64-v2|x86-64-v3|x86-64] [--shape fast|top] [--f64-leaves] [--float32-sums]
+    [--native | --target-cpu x86-64-v2|x86-64-v3|x86-64] [--compile-preset 1.1|1.0] [--lto off|fat] [--codegen-units N]
+    [--inline-threshold N|default] [--unit single|chunks] [--pgo on|off] [--cspgo on|off] [--shape fast] [--f64-leaves] [--float32-sums]
 ```
 
 `--average` says how the folds of a k-fold folder combine: `output` is the mean of each fold's outputs, `margin` the transform of the mean
@@ -314,7 +337,7 @@ margin. Backends (`scripts/backends.py`); all produce answers that equal the wal
   and so does a YDF `--float32-sums` file, with a base margin too. Forcing them (`FlatForest(path, engine=1|2)`) raises `evaluator.EngineRefused`, a
   `RuntimeError` that names the way out. An `engine` other than 0, 1 or 2 is a `ValueError`.
 - **Generated code is built portable, at the highest optimisation; building for the machine is an opt-in.** Every chunk is built at `opt-level`
-  3 in the build shape below (the driver's link was already 3), for the CPU `x86-64-v2` (SSE4.2 and POPCNT: Intel Nehalem and AMD Bulldozer, 2008-2011, and the mainstream x86 cores after them; a few small cores of those years, AMD Bobcat and the early Intel Atoms, lack them, and `--target-cpu x86-64` is the widest build; `generic` on
+  3 with the compile settings below (the driver's link was already 3), for the CPU `x86-64-v2` (SSE4.2 and POPCNT: Intel Nehalem and AMD Bulldozer, 2008-2011, and the mainstream x86 cores after them; a few small cores of those years, AMD Bobcat and the early Intel Atoms, lack them, and `--target-cpu x86-64` is the widest build; `generic` on
   arm). AVX2 and later are never compiled in by default. `--native` (API: `target_cpu="native"`) builds for the CPU of the machine instead, and
   **the build only runs on that CPU type**; `--target-cpu CPU` names any other (`x86-64-v3`, `x86-64`, anything `rustc --print target-cpus` lists;
   an unknown name is refused, rustc alone would only warn). `--native` together with another `--target-cpu` is refused. API:
@@ -322,19 +345,30 @@ margin. Backends (`scripts/backends.py`); all produce answers that equal the wal
   names the CPU. Default, native and widest-CPU builds are bit-identical (Rust does not fuse a multiply and an add without fast-math):
   `tests/test_codegen_target.py` and the quick differential pin it. The prebuilt evaluator library of the `flat` backends is baseline too (its AVX2
   engine is chosen at run time); `--target-cpu` and `--native` are refused with `--backend flat|wave|wave-avx2`.
-- **Build shape: `fast` (default) or `top`.** `fast` builds every chunk with `-C opt-level=3 -C lto=off -C codegen-units=16`. A chunk's trees are
-  written into up to 16 modules, because rustc makes one codegen unit per module and `codegen-units=16` splits nothing in a one-module source; the
-  units compile in parallel inside each `rustc`. `codegen-pgo` builds its instrumented binary, runs its profile and builds the final one in the SAME
-  shape, since a profile only matches code that was built the same way (the stale-profile gate below fails the build otherwise). `top` (`--shape top`;
-  API `options["shape"] = "top"`) is one codegen unit everywhere, in the chunks (one module each) and in the driver's link (`-C codegen-units=1`), and no LTO across chunks: slower to build; `fast` leaves the driver's link at rustc's own defaults. Chunks are
-  separate crates joined at link time, so neither shape has link-time optimisation across chunks (LIMITS.md). The shape changes how the code is
-  built, never what it computes: both give bit-identical answers (`tests/test_codegen_target.py::BuildShapeTest`). `--shape` is refused with
-  `--backend flat|wave|wave-avx2`; an unknown shape is refused in one line by the API (a `ValueError`) and by the option parser of the commands (exit 2). The result (`info["shape"]`, `info["codegen_units"]`, the `compile` line,
-  `report.md`) names the shape. Why `fast`: [bench/README-GENERATED-SHAPE.md](../bench/README-GENERATED-SHAPE.md).
+- **How the code is built: the compile settings (QF 1.1).** Five settings, each an API option and a flag of `compile` and `optimize`: `lto` (`off` | `fat`),
+  `codegen_units` (a whole number >= 1), `inline_threshold` (a whole number >= 0 for `-C llvm-args=-inline-threshold=N`, or `"default"` / `None` for rustc's own),
+  `pgo` (`"on"` | `"off"`; not given = on whenever the backend has profile rows) and `compile_preset` (`"1.1"` | `"1.0"`). The default is the `1.1` preset: every chunk
+  is built with `-C opt-level=3 -C codegen-units=16 -C llvm-args=-inline-threshold=3000` and NO `-C lto` (fat LTO is a no-op on a chunk crate, `--crate-type lib --emit obj`: the objects
+  are byte-identical, checked on rustc 1.99; it is emitted for the one-crate build, `--unit single`, where it acts), and the driver's link with `-C lto=fat -C llvm-args=-inline-threshold=3000` (rustc's own 16 codegen units; `-C codegen-units=N` is added only when `--codegen-units N` asks for another number),
+  so in the default `chunks` build fat LTO acts only on the driver's link.
+  It is ONE constant, `backend_codegen.DEFAULT_COMPILE_PRESET`: set it to `"1.0"` and the library builds as QF 1.0 did. `--compile-preset 1.0` is exactly QF 1.0's build, `-C opt-level=3
+  -C lto=off -C codegen-units=16` for every chunk (a chunk's trees are written into up to 16 modules, because rustc makes one codegen unit per module and `codegen-units=16`
+  splits nothing in a one-module source; the units compile in parallel inside each `rustc`) and no extra flag for the driver's link. `--shape fast` names QF 1.0's build
+  (`--shape top`, one codegen unit, was removed and is refused with a line that says so) and replaces the preset's lto / units / inline; the single flags then override what is left, in
+  the order preset, shape, flags. `codegen-pgo` builds its instrumented binary, runs its profile and builds the final one in EXACTLY the same flags (lto, units, inline, in the chunks and
+  in the driver's link), with `-C profile-generate` in place of `-C profile-use`, since a profile only matches code that was built the same way (the stale-profile gate below fails
+  the build otherwise). If rustc cannot make the instrumented build in that shape on a target, the build fails in one line (`BuildFailed`, naming `--pgo off` and `--compile-preset 1.0`); it
+  never falls back to another shape. `pgo=off` makes `best` build `codegen-block` even with `--data`; `pgo=on` is refused without `--data`, without llvm-profdata, with `--backend
+  codegen-block` and with `--backend auto`, and `pgo=off` with `--backend codegen-pgo`. `unit` (`"single"` | `"chunks"`, flag `--unit`): `chunks` (the default, ONE constant `backend_codegen.DEFAULT_COMPILE_UNIT`) builds every chunk as its own crate and joins the objects at link time, so LTO does not cross chunks (LIMITS.md); `single` builds the whole forest and the driver as ONE crate whose modules are the chunks (`rustc` makes one codegen unit per module and merges them down to `codegen_units`; fat LTO then sees everything), as ONE `rustc` process: the plan estimates its peak on all the nodes at once and, if it does not fit in the free RAM, builds chunks instead with one `RAM:` line and `info["unit_fallback"]`. `--compile-preset 1.0` and `--shape` are chunks unless `--unit single` is given (it overrides their unit like any other setting). The instrumented and the final build use the same `unit`. The settings
+  change how the code is built, never what it computes: the answers are bit-identical (`tests/test_codegen_target.py::BuildShapeTest`, `tests/test_compile_settings.py`). All of them are refused with
+  `--backend flat|wave|wave-avx2` (one line naming the flags given); a bad value is refused in one line by the API (a `ValueError`) and by the option parser of the commands (exit 2 or 3).
+  The result records the build (`info["compile_preset"]` = the preset the settings equal or `custom`, `info["lto"]`, `info["codegen_units"]` (the units the RAM plan left), `info["inline_threshold"]`,
+  `info["pgo"]`, `info["build"]` as a phrase, `info["shape"]` = `fast` or `custom`, `info["peak_factor"]`; the `compile` line, `report.md`). In `compare` and `choose`: `--opt lto=fat`,
+  `--opt inline_threshold=3000`, `--opt compile_preset=1.0` (`pgo` is not an option of `choose`: it builds both). Why QF 1.0 chose `fast`: [bench/README-GENERATED-SHAPE.md](../bench/README-GENERATED-SHAPE.md).
 - **The build plans its jobs against the free RAM and never swaps.** Before it builds, it estimates the peak of the `rustc` jobs that run together
-  (`backend_codegen.rustc_peak_estimate_mb`, from the chunk sizes and the codegen units; the constants and where they come from are in
+  (`backend_codegen.rustc_peak_estimate_mb`, from the chunk sizes and the codegen units, scaled by `backend_codegen.peak_factor` for the inline threshold and, in a `--unit single` build, fat LTO, and the driver's link by `backend_codegen.link_peak_factor`; the constants and where they come from are in
   that function's comment) and keeps it within 85 % of the RAM available: the smaller of `MemAvailable` and what a cgroup memory limit still
-  leaves. If the wanted `jobs` (default 3) at the wanted units do not fit, it lowers the jobs first (down to 1), then the units (halved each
+  leaves (read from `/proc/meminfo` and the cgroup files, so on a system without them, macOS or Windows, the free RAM is unknown: the plan cannot lower anything, the build uses the jobs and units asked for and the `RAM:` line says "available RAM could not be read"). If the wanted `jobs` (default 3) at the wanted units do not fit, it lowers the jobs first (down to 1), then the units (halved each
   time), then the chunk size (halved, down to 4,000 nodes), and prints ONE line on stderr, `RAM: building with N jobs / M units`, with what it
   changed and the MB free when it changed anything. If one job on a 4,000-node chunk does not fit, the build is refused in one line
   (`backend_codegen.NotEnoughRam`, a `ValueError`: exit 3), and `--backend best` falls back to the flat format with a notice. `options["ram_mb"]`
@@ -426,7 +460,7 @@ ARTIFACT is loaded as `backends.load_artifact` does: the backend named in `ARTIF
 regular file (`/dev/null`), is refused in one line (exit 1); a write that fails anyway after the run is one line naming the verdict and the
 path, exit 1.
 
-It compares the compiled forest with the source library on your rows, on `--random` rows built to hit the split thresholds exactly
+For a model of several outputs the decisions it compares are one integer per output (per segment); a scikit-learn estimator passed as the model is judged against too. It compares the compiled forest with the source library on your rows, on `--random` rows built to hit the split thresholds exactly
 (equal, one float32 step above and below) and NaN, and on up to four times as many `paths` rows that reach split nodes and fall
 on their threshold, a step below it and missing. The nodes are sampled with a budget of 4/3 of `--random` (13,333 at the default 10,000; 3/4 of that with a categorical split): every tree is asked for at least one node, but the quotas round up, so a forest of several thousand trees whose quotas add up to more than the budget keeps a random subset of the picks and a few of its trees (91 of 7,500 in one case measured) have no path row; raise `--random` to reach every tree. It exits 1 unless the maximum difference is <= 1e-6 (relative to `max(1, |value|)`) and
 every unambiguous decision is identical; for xgboost the difference must be 0 (see the exceptions in the accuracy table of LIMITS.md). `--absolute` judges the bar on the plain difference (a log-scale output of 12 then has to match to 1e-6
@@ -570,7 +604,7 @@ the nodes: 8 bytes each, holding the float32 threshold (the leaf value at a leaf
 next node, trees are laid out depth first), the feature and the default direction for NaN. The file is read through a memory map, so
 loading costs a page-table update rather than a parse (`bench/README-NUMBERS.md` section 1 gives the load times). Formats: 4 for a plain
 float32 forest (what an xgboost forest produces), 5 when the forest needs double sums, extended nodes (zero-as-missing, categories) or an
-identity objective with several groups, 6 when it has linear leaves or, with `--f64-leaves`, leaves that float32 would round. (Formats 1 to 3
+identity objective with several groups, 6 when it has linear leaves or, with `--f64-leaves`, leaves that float32 would round. 7 when the forest holds vector leaves (a tree whose leaves each add a row of `groups` values to groups 0, 1, ...; flag bit 4, `vec_leaves` and `n_segments` in header bytes 56..64, so no margin scale; a vector table of float32, or float64 with flag bit 5, then `n_segments + 1` offsets naming each output's columns; a sigmoid over several groups only with vector leaves). A format-7 file may also hold no vector leaves (flag bit 4 clear, `vec_leaves` 0, `n_segments` >= 1): scalar trees plus the segment table, written for a one-tree-per-output identity forest (xgboost `one_output_per_tree` regression with several targets) so that it names K regression outputs, as the generated code does. Formats 4-6 load unchanged, and a forest with one output is written byte-identical to 1.1. (Formats 1 to 3
 were written before the checksum covered the header; such a file is refused with a line that says to compile the model again.) The exact layout is the comment at the top of `rust/src/lib.rs`. A categorical node looks up `trunc(x)`: NaN, a value below 0 after truncation toward zero (so -0.5 is category 0, which can go left) and an absent category go right, as in LightGBM.
 
 The margin scale `s` of a LightGBM binary model (above) is not used by the walker; the library reports it (`tfl_margin_scale`, which
@@ -617,6 +651,7 @@ LightGBM or YDF model, pruned or not (a folder of folds is refused: export one f
 | `default_left` | bool (nodes,) | where NaN goes; False at a leaf |
 | `zero_missing` | bool (nodes,) | the node also sends `\|x\| <= float32(1e-35)` (1.0000000180025095e-35) the `default_left` way (LightGBM zero-as-missing); False at a leaf |
 | `leaf_index` | int32 (nodes,) | the leaf's ordinal among its tree's leaves in node order, -1 at an inner node |
+| `leaf_vector` | float32 (nodes, groups) | only for vector trees (sklearn and YDF multi-class forests, xgboost `multi_output_tree`; their `tree_group` is -1): the row a leaf adds to every group, zeros at an inner node. Absent for scalar trees |
 
 A walk: a row goes left when `x[feature] < threshold` (NaN the way `default_left` says; at a `zero_missing` node also a value with
 `|x| <= float32(1e-35)`), and the margin of group `g` is `base_margin[g]` plus the leaf values the row reaches in the trees whose `tree_group` is `g`,

@@ -2,7 +2,8 @@
 """One command to a ready forest: prune -> held-out agreement -> compile -> equality test. Refuses to emit a model that fails a bar.
 
     quickforest optimize MODEL --data DATA.npz --keep 10%|50%|30|auto|100% --compile --verify [--out DIR] [--regression log|raw]
-                         [--backend best|flat|codegen-pgo|...] [--native | --target-cpu x86-64-v3|...] [--shape fast|top]
+                         [--backend best|flat|codegen-pgo|...] [--native | --target-cpu x86-64-v3|...]
+                         [--compile-preset 1.1|1.0] [--lto off|fat] [--codegen-units N] [--inline-threshold N|default] [--pgo on|off] [--shape fast]
 
 --keep is the size you choose: a share (`50%`, `25%`, `10%`), a count per class (`30`), `100%` for no pruning (compile the whole forest, exact),
 or `auto`: try the rungs of --keep-ladder (default 5%,10%,25%,50%), smallest first, keep the SMALLEST that passes the bar of the run, and, if
@@ -15,8 +16,9 @@ the regression bar: median |pruned - full| <= 0.5 %, none above 2 %, held-out er
 --compile builds the fastest artifact this machine can make (`--backend best`, the default): generated code profiled on --data (`codegen-pgo`) for
 the portable x86-64-v2 CPU (`generic` on arm); the flat format only where rustc is missing, too little RAM is free or the model is too big for generated
 code (the report says why; without an llvm-profdata of rustc's LLVM version the build is `codegen-block`). --native builds for the CPU of this machine instead: the build only runs on that CPU type, and it measured no faster than the portable build on our workloads (a library
-built for features the CPU lacks is refused when loaded). Generated code is built in the `fast` shape (opt 3, no link-time optimisation, 16 codegen units,
-the profile-guided pass in the same shape) unless --shape top asks for one codegen unit everywhere (chunks and driver) and no LTO across chunks; the build plans its parallel jobs against the free RAM.
+built for features the CPU lacks is refused when loaded). Generated code is built with fat link-time optimisation, 16 codegen units and an inline threshold of 3000 (the `1.1` compile preset; the
+profile-guided pass in exactly the same shape) unless --compile-preset 1.0 asks for QF 1.0's build (no LTO, 16 codegen units a chunk) or --lto, --codegen-units, --inline-threshold, --pgo
+or --shape set one setting (--unit single builds the whole forest as ONE crate, so LTO crosses the chunks; it needs more RAM and falls back to chunks if it does not fit); the build plans its parallel jobs against the free RAM, and fat LTO needs more of it.
 
 Bars: held-out agreement >= --min-agreement (set it from your own real-case bar), and with --verify the compiled forest equal to
 the model's own library (<= 1e-6, identical decisions). On a failed bar nothing but report.md / report.json is left in DIR and the
@@ -40,7 +42,6 @@ import backend_codegen
 import backends
 import check
 import compile
-import numpy as np
 import prune
 import qf_common as qf
 import qf_formats
@@ -87,6 +88,12 @@ def optimize(
     average="output",
     target_cpu=None,
     shape=None,
+    compile_preset=None,
+    lto=None,
+    codegen_units=None,
+    inline_threshold=None,
+    unit=None,
+    pgo=None,
     seed=15,
     sub=1.0,
     threads=None,
@@ -98,6 +105,7 @@ def optimize(
 ) -> dict:
     if not math.isfinite(min_agreement):
         raise ValueError(f"min_agreement must be a finite number, got {min_agreement}")
+    estimator = None if prune.is_model_path(model) else model  # a fitted sklearn estimator: exported to work/model.qfsk below
     prune.check_options(sub=sub, seed=seed)
     prune.check_keep(keep, keep_ladder, min_agreement)  # a bad --keep-ladder is found now, before any work
     if accept_any and prune.is_auto(keep):
@@ -106,7 +114,7 @@ def optimize(
         )
     if (f64_leaves or float32_sums) and not compile_:
         raise ValueError("--f64-leaves and --float32-sums shape the compiled forest: add --compile")
-    if float32_sums and any(qf_formats.detect(f) != "ydf" for f in qf_formats.model_files(model)):
+    if float32_sums and (estimator is not None or any(qf_formats.detect(f) != "ydf" for f in qf_formats.model_files(model))):
         # compile refuses this at once; here it would have pruned first and only then found that nothing can be compiled
         raise ValueError(FLOAT32_SUMS_YDF_ONLY)
     if verify:
@@ -118,9 +126,24 @@ def optimize(
     if target_cpu and not compile_:
         raise ValueError("--native and --target-cpu shape the compiled forest: add --compile")
     backend_codegen.resolve_target_cpu({"target_cpu": target_cpu})  # a bad CPU name is found now, not after the pruning
-    backend_codegen.resolve_shape({"shape": shape})  # and a bad shape
-    if shape and not compile_:
-        raise ValueError("--shape shapes the compiled forest: add --compile")
+    build = {
+        k: v
+        for k, v in dict(
+            shape=shape,
+            compile_preset=compile_preset,
+            lto=lto,
+            codegen_units=codegen_units,
+            inline_threshold=inline_threshold,
+            unit=unit,
+            pgo=pgo,
+        ).items()
+        if v is not None
+    }
+    backend_codegen.resolve_compile(build)  # and a bad build setting
+    if build and not compile_:
+        raise ValueError(
+            f"{', '.join('--' + k.replace('_', '-') for k in build)} shape{'s' if len(build) == 1 else ''} the compiled forest: add --compile"
+        )
     out = Path(out)
     if out.exists() and not out.is_dir():
         raise SystemExit(f"{out} is a file, not a folder: choose a new --out")
@@ -133,22 +156,43 @@ def optimize(
         raise SystemExit(f"{out}: cannot create the output folder ({e.strerror})") from None
     try:
         t0 = time.perf_counter()
+        if estimator is not None:  # verified against the estimator before it is written; the file is moved to OUT with the rest on success
+            model, exported = prune.export_estimator(estimator, work, data)
         rep, failures, kept = {"model": str(model), "keep": keep, "stages": {}}, [], None
+        if estimator is not None:
+            rep["library_diff"], rep["export"] = exported["max_diff"], exported
         if prune.keeps_all(keep):
             pruned = work / "pruned"
             pruned.mkdir()
             kept = {}
             # the data and the regression bar are validated as in every pruned run, though nothing is selected from them
-            rows = qf.load_data_cli(data)["X"]
+            data_all = qf.load_data_cli(data)
+            rows = data_all["X"]
             # the same checks as every pruned run: a stray file or a mixed folder is refused, not copied
             for f in qf_formats.model_files(model):
                 src = qf_formats.open_source(f)
                 qf.check_width(rows, src.spec.n_features, data)
+                sp0 = src.spec
+                if regression or not (sp0.task == "regression" and sp0.groups > 1):  # K-target regression: y is read with the bar only
+                    qf.require_truth_columns(
+                        data_all.get("y"),
+                        qf.truth_outputs(sp0.groups, sp0.kind, sp0.task, sp0.vector_width, getattr(src, "segments", None)),
+                        data,
+                    )
                 if src.spec.task == "classification":  # the rule is only built here to refuse one that cannot be used
-                    qf.make_rule(decision, src.spec.groups, src.spec.kind, None, None, src.spec.task)
+                    sp = src.spec
+                    qf.make_rule(
+                        decision,
+                        sp.groups,
+                        sp.kind,
+                        None,
+                        None,
+                        sp.task,
+                        qf.decision_segments(sp.groups, sp.kind, sp.vector_width, getattr(src, "segments", None)),
+                    )
                 if regression and src.spec.task != "regression":
                     raise SystemExit(f"{f.name}: the regression bar needs a regression model (this one is {src.spec.task})")
-                kept[f.name] = prune.kept_indices(src, [np.flatnonzero(src.spec.tree_info == g) for g in range(src.spec.groups)])
+                kept[f.name] = prune.kept_indices(src, prune.all_trees(src))
                 if f.is_dir():
                     shutil.copytree(f, pruned / f.name)
                 else:
@@ -192,6 +236,9 @@ def optimize(
             elif not whole and not prune.meets_agreement(pr["heldout"], min_agreement):  # the whole forest agrees with itself, exactly
                 h = pr["heldout"]
                 bar_failures.append(f"held-out agreement {100 * h['same'] / max(1, h['rows']):.4f} % < bar {min_agreement} %")
+                for j, pct in enumerate(h.get("agreement_pct_per_output", ())):
+                    if pct is not None and pct < min_agreement:
+                        bar_failures[-1] += f" (output {j}: {pct} %)"
             if accept_any:  # the size was asked for: the figures are reported, and the bar does not stop the run
                 rep["accept_any"] = {"waived": bar_failures, "min_agreement": None if regression else min_agreement}
             else:
@@ -201,7 +248,7 @@ def optimize(
             try:
                 chosen = backend == "best"
                 if chosen:  # named before the build: the artifact's suffix says how it loads
-                    backend, notice = compile.resolve_best(pruned, average, float32_sums)
+                    backend, notice = compile.resolve_best(pruned, average, float32_sums, options=build)
                 artifact = work / ("model.bin" if backend == "auto" else f"model{backends.get(backend).suffix}")
                 rep["stages"]["compile"] = compile.compile_model(
                     pruned,
@@ -213,8 +260,9 @@ def optimize(
                     f64_leaves=f64_leaves,
                     float32_sums=float32_sums,
                     target_cpu=target_cpu,
-                    shape=shape,
-                    pgo_fallback=chosen,  # profile rows too few or unlike one another: codegen-block, with a notice, as `best` does
+                    **build,
+                    # profile rows too few or unlike one another: codegen-block, with a notice, as `best` does; not when `--pgo on` asked for the profile by name
+                    pgo_fallback=chosen and backend_codegen.resolve_compile(build)["pgo"] != "on",
                 )
                 if notice:  # the choice's notice first, then what the build itself said (its fallback)
                     built = rep["stages"]["compile"].get("notice")
@@ -325,7 +373,7 @@ def report_md(rep: dict, out: Path) -> str:
             if "target_cpu" in c
             else ""
         )
-        target += f", {c['shape']} shape" if "shape" in c else ""
+        target += f", {c['build']}" if "build" in c else ""
         lines.append(f"- compile ({c['backend']}{target}): {c['bytes'] / 1e6:.2f} MB, {c['trees']:,} trees, {c['nodes']:,} nodes")
         if "profile_rows" in c:
             lines.append(
@@ -404,12 +452,7 @@ def main(argv=None):
         action="store_true",
         help="build for the CPU of THIS machine (--target-cpu native): the build only runs on that CPU type; measured no faster than the portable build on our workloads",
     )
-    ap.add_argument(
-        "--shape",
-        choices=tuple(backend_codegen.SHAPES),
-        help="how generated code is built: fast (default: opt 3, no link-time optimisation, 16 codegen units; the profile-guided pass in the same shape) "
-        "or top (one codegen unit everywhere, chunks and driver, and no LTO across chunks; slower to build)",
-    )
+    backend_codegen.add_compile_arguments(ap)
     ap.add_argument("--average", choices=("output", "margin"), default="output")
     ap.add_argument("--seed", type=int, default=15)
     ap.add_argument("--sub", type=float, default=1.0)
@@ -457,7 +500,7 @@ def main(argv=None):
             min_agreement=a.min_agreement,
             backend=a.backend,
             target_cpu=backend_codegen.cpu_option(a.native, a.target_cpu),
-            shape=a.shape,
+            **{k: v for k, v in backend_codegen.compile_options(a).items()},
             average=a.average,
             seed=a.seed,
             sub=a.sub,
