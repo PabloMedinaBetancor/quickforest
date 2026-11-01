@@ -1455,7 +1455,8 @@ class PipelineTest(unittest.TestCase):
         subprocess.run([sys.executable, "-c", big], check=True)
         info = compile.compile_model(self.t / "gb.ubj", self.t / "peak.so", backend="codegen", block=64)
         self.assertGreater(info["rustc_peak_mb"], 20)  # a real figure
-        self.assertLess(info["rustc_peak_mb"], 700, info)  # below the planted child's 700 MB: this build's own peak, not the biggest child ever waited for
+        # below the planted child's 700 MB: this build's own peak, not the biggest child ever waited for
+        self.assertLess(info["rustc_peak_mb"], 700, info)
 
     def test_backend_auto_keeps_the_fastest_exact_one(self):
         """`compile --backend auto`: times what can run here on held-out rows, keeps an exact winner, remembers it in OUT.choice.json."""
